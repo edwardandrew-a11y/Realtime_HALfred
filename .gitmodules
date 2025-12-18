@@ -1,0 +1,3 @@
+[submodule "ScreenMonitorMCP"]
+	path = ScreenMonitorMCP
+	url = https://github.com/inkbytefo/ScreenMonitorMCP.git

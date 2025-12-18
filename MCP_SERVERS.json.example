@@ -1,0 +1,14 @@
+[
+  {
+    "name": "screen-monitor",
+    "transport": "stdio",
+    "params": {
+      "command": "/absolute/path/to/ScreenMonitorMCP/.venv/bin/python",
+      "args": ["-m", "screenmonitormcp_v2.mcp_main"],
+      "env": {
+        "OPENAI_API_KEY": "${OPENAI_API_KEY}",
+        "OPENAI_MODEL": "gpt-4o"
+      }
+    }
+  }
+]
