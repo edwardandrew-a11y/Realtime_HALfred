@@ -8,6 +8,7 @@ Realtime HALfred uses:
 - **OpenAI Realtime API** (`gpt-realtime`) for low-latency voice interactions with native STT
 - **ElevenLabs** for high-quality, natural text-to-speech output
 - **ScreenMonitorMCP** for AI vision and screen analysis capabilities
+- **PTY Terminal Access** for safe shell command execution with user confirmation
 - **MCP (Model Context Protocol)** for extensible tool integration
 - **Semantic VAD** for intelligent turn detection
 - **Whisper-1** for optional input audio transcription (debugging)
@@ -18,6 +19,7 @@ Realtime HALfred uses:
 - 🗣️ **Natural TTS** - ElevenLabs streaming audio for low-latency, natural speech
 - 🎭 **Personality-Driven** - Halfred has a distinct personality: sardonic, helpful, and unfiltered
 - 👁️ **Vision Capabilities** - Screen capture and AI-powered visual analysis through MCP
+- 💻 **Terminal Access** - Safe shell command execution with command-level safety controls
 - 🔧 **Extensible Tools** - MCP integration allows adding new capabilities easily
 - 🎧 **Half-Duplex Audio** - Automatic mic muting during playback to prevent echo
 
@@ -41,6 +43,39 @@ These tools enable Halfred to:
 - Analyze UI/UX design
 - Monitor system performance
 - Assist with visual tasks and documentation
+
+### MCP Tools (PTY Terminal Access)
+Halfred has safe terminal access through the PTY proxy:
+
+**`pty_bash_execute`** - Execute shell commands with command-level safety controls
+
+**Safety Features:**
+- **Safe commands** (pwd, ls, cat, grep, find, etc.) execute automatically without prompts
+- **Risky commands** (mkdir, rm, chmod, network ops) require user confirmation
+- **Dangerous commands** (rm -rf, sudo, dd) show strong warnings before execution
+- Command parsing detects dangerous patterns (pipes to shell, output redirection, etc.)
+
+**Safe Commands (Auto-Approved):**
+- Navigation: `pwd`, `cd`, `ls`, `tree`, `find`
+- Reading: `cat`, `less`, `more`, `head`, `tail`, `grep`
+- Info: `stat`, `file`, `du`, `df`, `whoami`, `uname`, `id`
+
+**Use Cases:**
+- Navigate directories and inspect file contents
+- Search for files and patterns
+- Gather system information
+- Debug file permissions and ownership
+- Explore project structures
+
+### MCP Tools (Filesystem)
+Safe filesystem operations with user confirmation for risky actions:
+
+1. **`read_file`** - Read file contents
+2. **`write_file`** - Create or overwrite files (requires confirmation)
+3. **`edit_file`** - Make selective edits to files (requires confirmation)
+4. **`list_directory`** - List directory contents
+5. **`search_files`** - Search for files by pattern
+6. **`get_file_info`** - Get file metadata
 
 ## Setup
 
@@ -93,7 +128,7 @@ cp .env.example .env
 ```env
 OPENAI_API_KEY=your-openai-api-key-here
 ELEVENLABS_API_KEY=your-elevenlabs-api-key-here
-ELEVENLABS_VOICE_ID=2ajXGJNYBR0iNHpS4VZb  # Optional: defaults to Rachel voice
+ELEVENLABS_VOICE_ID=2ajXGJNYBR0iNHpS4VZb  # Optional: defaults to Rob voice
 
 # Personalize Halfred's knowledge about you
 USER_NAME=Your Name
@@ -101,6 +136,9 @@ USER_CONTEXT=your occupation, interests, hobbies, etc.
 ```
 
 3. **Configure MCP servers in `MCP_SERVERS.json`:**
+
+See `MCP_SERVERS.json.example` for a complete example. Minimal configuration:
+
 ```json
 [
   {
@@ -114,9 +152,28 @@ USER_CONTEXT=your occupation, interests, hobbies, etc.
         "OPENAI_MODEL": "gpt-4o"
       }
     }
+  },
+  {
+    "name": "pty-proxy",
+    "transport": "stdio",
+    "params": {
+      "command": "python",
+      "args": ["pty_proxy_mcp.py"]
+    },
+    "client_session_timeout_seconds": 60
+  },
+  {
+    "name": "filesystem",
+    "transport": "stdio",
+    "params": {
+      "command": "python",
+      "args": ["filesystem_proxy_mcp.py"]
+    }
   }
 ]
 ```
+
+**Note:** PTY terminal access is enabled by default. To disable it, remove the `pty-proxy` entry or set `PTY_REQUIRE_APPROVAL=false` in `.env`.
 
 ## Usage
 
@@ -227,20 +284,33 @@ python -c "import sounddevice as sd; print(sd.query_devices())"
 | `MCP_SERVERS_JSON_FILE` | No | `MCP_SERVERS.json` | Path to MCP servers config file |
 | `MCP_CLIENT_TIMEOUT_SECONDS` | No | `30` | Timeout for MCP tool calls |
 | `MCP_DEMO_FILESYSTEM_DIR` | No | - | Optional demo filesystem MCP server |
+| `PTY_REQUIRE_APPROVAL` | No | `true` | Require user confirmation for risky shell commands |
+| `PTY_SAFE_COMMANDS` | No | See `.env.example` | Comma-separated list of safe commands |
+| `FILESYSTEM_REQUIRE_APPROVAL` | No | `true` | Require user confirmation for risky file operations |
 
 ## Project Structure
 
 ```
 Realtime_HALfred/
-├── main.py                 # Main application entry point
-├── MCP_SERVERS.json        # MCP server configuration
-├── .env                    # Environment variables (API keys)
-├── .env.example            # Example environment file
-├── .gitignore              # Git ignore rules
-├── .gitmodules             # Git submodule configuration
-├── README.md               # This file
-├── ScreenMonitorMCP/       # Screen monitoring MCP server (submodule)
-└── .venv/                  # Python virtual environment
+├── main.py                     # Main application entry point
+├── MCP_SERVERS.json            # MCP server configuration
+├── MCP_SERVERS.json.example    # Example MCP configuration
+├── .env                        # Environment variables (API keys)
+├── .env.example                # Example environment file
+├── pty_command_safety.py       # PTY command safety module
+├── pty_proxy_mcp.py            # PTY MCP proxy server
+├── filesystem_proxy_mcp.py     # Filesystem MCP proxy server
+├── filesystem_safety.py        # Filesystem safety module
+├── test_pty_safety.py          # PTY safety test suite
+├── test_filesystem_safety.py   # Filesystem safety test suite
+├── config.yaml                 # PTY-mcp-server configuration
+├── requirements.txt            # Python dependencies
+├── .gitignore                  # Git ignore rules
+├── .gitmodules                 # Git submodule configuration
+├── README.md                   # This file
+├── ScreenMonitorMCP/           # Screen monitoring MCP server (submodule)
+├── data/                       # Data directory (logs, etc.)
+└── .venv/                      # Python virtual environment
 ```
 
 ## License

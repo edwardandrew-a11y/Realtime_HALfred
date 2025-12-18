@@ -9,6 +9,25 @@
         "OPENAI_API_KEY": "${OPENAI_API_KEY}",
         "OPENAI_MODEL": "gpt-4o"
       }
-    }
+    },
+    "client_session_timeout_seconds": 30
+  },
+  {
+    "name": "pty-proxy",
+    "transport": "stdio",
+    "params": {
+      "command": "python",
+      "args": ["/absolute/path/to/Realtime_HALfred/pty_proxy_mcp.py"]
+    },
+    "client_session_timeout_seconds": 60
+  },
+  {
+    "name": "filesystem",
+    "transport": "stdio",
+    "params": {
+      "command": "python",
+      "args": ["/absolute/path/to/Realtime_HALfred/filesystem_proxy_mcp.py"]
+    },
+    "client_session_timeout_seconds": 30
   }
 ]

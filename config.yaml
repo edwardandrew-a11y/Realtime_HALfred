@@ -1,0 +1,10 @@
+logDir: ./data/pty-logs
+logLevel: Info
+toolsDir: ./pty-tools
+prompts:
+  - "$ "
+  - "> "
+  - "password:"
+  - "Press Enter to continue"
+  - "y/n"
+  - "yes/no"
