@@ -1,0 +1,10 @@
+# Core dependencies for Realtime HALfred
+python-dotenv>=1.0.0
+sounddevice>=0.4.6
+elevenlabs>=1.0.0
+
+# OpenAI Agents SDK for realtime and MCP support
+openai-agents>=0.6.0
+
+# MCP (Model Context Protocol) server support
+mcp>=0.1.0
