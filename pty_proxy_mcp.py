@@ -15,6 +15,7 @@ The server communicates via stdio using the MCP protocol.
 import asyncio
 import json
 import os
+import platform
 import subprocess
 import sys
 from typing import Any
@@ -86,14 +87,25 @@ async def execute_command(
         # Use the current working directory if none specified
         cwd = working_dir if working_dir and os.path.isdir(working_dir) else None
 
-        # Execute command in bash
+        # Determine shell executable based on platform
+        system = platform.system()
+        if system == "Windows":
+            # Windows: use cmd.exe
+            shell_executable = None  # Use default shell on Windows
+            shell = True
+        else:
+            # Unix/Linux/macOS: use bash
+            shell_executable = "/bin/bash"
+            shell = True
+
+        # Execute command in appropriate shell
         process = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
-            shell=True,
-            executable="/bin/bash"
+            shell=shell,
+            executable=shell_executable
         )
 
         # Wait for completion with timeout

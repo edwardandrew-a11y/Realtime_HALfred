@@ -3,31 +3,24 @@
     "name": "screen-monitor",
     "transport": "stdio",
     "params": {
-      "command": "/absolute/path/to/ScreenMonitorMCP/.venv/bin/python",
+      "command": "python",
       "args": ["-m", "screenmonitormcp_v2.mcp_main"],
       "env": {
         "OPENAI_API_KEY": "${OPENAI_API_KEY}",
         "OPENAI_MODEL": "gpt-4o"
       }
     },
-    "client_session_timeout_seconds": 30
+    "client_session_timeout_seconds": 30,
+    "comment": "Requires ScreenMonitorMCP submodule: git submodule update --init && cd ScreenMonitorMCP && pip install -e ."
   },
   {
     "name": "pty-proxy",
     "transport": "stdio",
     "params": {
       "command": "python",
-      "args": ["/absolute/path/to/Realtime_HALfred/pty_proxy_mcp.py"]
+      "args": ["pty_proxy_mcp.py"]
     },
-    "client_session_timeout_seconds": 60
-  },
-  {
-    "name": "filesystem",
-    "transport": "stdio",
-    "params": {
-      "command": "python",
-      "args": ["/absolute/path/to/Realtime_HALfred/filesystem_proxy_mcp.py"]
-    },
-    "client_session_timeout_seconds": 30
+    "client_session_timeout_seconds": 60,
+    "comment": "Terminal command execution with safety controls. Works on Windows (cmd.exe), macOS, and Linux (bash)."
   }
 ]

@@ -1,3 +1,5 @@
+# PTY Proxy MCP Configuration
+# Note: Paths use forward slashes (/) which work cross-platform in Python
 logDir: ./data/pty-logs
 logLevel: Info
 toolsDir: ./pty-tools

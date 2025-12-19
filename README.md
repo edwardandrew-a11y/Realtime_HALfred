@@ -67,55 +67,111 @@ Halfred has safe terminal access through the PTY proxy:
 - Debug file permissions and ownership
 - Explore project structures
 
-### MCP Tools (Filesystem)
-Safe filesystem operations with user confirmation for risky actions:
-
-1. **`read_file`** - Read file contents
-2. **`write_file`** - Create or overwrite files (requires confirmation)
-3. **`edit_file`** - Make selective edits to files (requires confirmation)
-4. **`list_directory`** - List directory contents
-5. **`search_files`** - Search for files by pattern
-6. **`get_file_info`** - Get file metadata
+**Platform Support:**
+- **macOS/Linux:** Uses `/bin/bash` for command execution
+- **Windows:** Uses `cmd.exe` for command execution
+- Safety controls work identically across all platforms
 
 ## Setup
 
 ### Prerequisites
-- Python 3.8+
-- macOS (for audio I/O with sounddevice)
-- OpenAI API key
-- ElevenLabs API key
+
+#### All Platforms
+- **Python 3.8+** (Python 3.10+ recommended)
+- **OpenAI API key** (with Realtime API access)
+- **ElevenLabs API key** (for TTS)
+- **Git** (with submodule support)
+
+#### Platform-Specific Requirements
+
+**macOS:**
+- Audio works out of the box (Core Audio)
+- Terminal access via bash (built-in)
+
+**Windows:**
+- PortAudio DLL (automatically installed with `sounddevice` package)
+- Terminal access via cmd.exe (built-in)
+- **Note:** Some Windows security software may flag microphone/screen access - grant permissions when prompted
+
+**Linux:**
+- Install PortAudio library:
+  ```bash
+  # Debian/Ubuntu
+  sudo apt-get install libportaudio2
+
+  # Fedora/RHEL
+  sudo dnf install portaudio
+
+  # Arch
+  sudo pacman -S portaudio
+  ```
+- Terminal access via bash (built-in)
 
 ### Installation
 
-1. **Clone the repository:**
+#### 1. Clone the repository with submodules
+
 ```bash
-git clone --recursive <your-repo-url>
+# Clone with all submodules
+git clone --recursive https://github.com/edwardandrew-a11y/Realtime_HALfred.git
 cd Realtime_HALfred
 ```
 
-2. **Create and activate virtual environment:**
+If you already cloned without `--recursive`:
+```bash
+cd Realtime_HALfred
+git submodule update --init --recursive
+```
+
+#### 2. Create and activate virtual environment
+
+**macOS/Linux:**
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-3. **Install Python dependencies:**
-```bash
-pip install -r requirements.txt  # or install packages from main.py imports
+**Windows (PowerShell):**
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
 ```
 
-Key dependencies:
-- `openai-agents` (with realtime support)
-- `elevenlabs`
-- `sounddevice`
-- `python-dotenv`
+**Windows (Command Prompt):**
+```cmd
+python -m venv .venv
+.venv\Scripts\activate.bat
+```
 
-4. **Set up ScreenMonitorMCP submodule:**
+#### 3. Install main dependencies
+
+```bash
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+**Key dependencies installed:**
+- `openai-agents>=0.6.0` - OpenAI Agents SDK with Realtime API support
+- `elevenlabs>=1.0.0` - ElevenLabs TTS API
+- `sounddevice>=0.4.6` - Cross-platform audio I/O
+- `python-dotenv>=1.0.0` - Environment variable management
+- `mcp>=1.0.0` - Model Context Protocol support
+
+#### 4. Install ScreenMonitorMCP submodule
+
 ```bash
 cd ScreenMonitorMCP
 pip install -e .
 cd ..
 ```
+
+This installs the screen monitoring capabilities with dependencies:
+- `fastapi`, `uvicorn` - Web framework
+- `mss` - Screenshot capture
+- `Pillow` - Image processing
+- `openai` - Vision API client
+- `psutil` - System monitoring
+- `pydantic`, `structlog`, `aiosqlite` - Supporting libraries
 
 ### Configuration
 
@@ -135,9 +191,9 @@ USER_NAME=Your Name
 USER_CONTEXT=your occupation, interests, hobbies, etc.
 ```
 
-3. **Configure MCP servers in `MCP_SERVERS.json`:**
+3. **Configure MCP servers (should work as-is):**
 
-See `MCP_SERVERS.json.example` for a complete example. Minimal configuration:
+The `MCP_SERVERS.json` file is already configured with relative paths and should work out of the box after installation:
 
 ```json
 [
@@ -145,7 +201,7 @@ See `MCP_SERVERS.json.example` for a complete example. Minimal configuration:
     "name": "screen-monitor",
     "transport": "stdio",
     "params": {
-      "command": "/Users/YOUR_USERNAME/PATH_TO/ScreenMonitorMCP/.venv/bin/python",
+      "command": "python",
       "args": ["-m", "screenmonitormcp_v2.mcp_main"],
       "env": {
         "OPENAI_API_KEY": "${OPENAI_API_KEY}",
@@ -161,28 +217,34 @@ See `MCP_SERVERS.json.example` for a complete example. Minimal configuration:
       "args": ["pty_proxy_mcp.py"]
     },
     "client_session_timeout_seconds": 60
-  },
-  {
-    "name": "filesystem",
-    "transport": "stdio",
-    "params": {
-      "command": "python",
-      "args": ["filesystem_proxy_mcp.py"]
-    }
   }
 ]
 ```
 
-**Note:** PTY terminal access is enabled by default. To disable it, remove the `pty-proxy` entry or set `PTY_REQUIRE_APPROVAL=false` in `.env`.
+**Notes:**
+- Uses `python` command (works with activated virtual environment)
+- Environment variables like `${OPENAI_API_KEY}` are automatically substituted from your `.env` file
+- PTY terminal access is enabled by default. To disable it, remove the `pty-proxy` entry or set `PTY_REQUIRE_APPROVAL=false` in `.env`
+- See `MCP_SERVERS.json.example` for additional configuration options
 
 ## Usage
 
 1. **Start Halfred:**
+
+**macOS/Linux:**
 ```bash
 python main.py
 ```
 
-2. **Grant microphone permissions** when macOS prompts.
+**Windows:**
+```cmd
+python main.py
+```
+
+2. **Grant necessary permissions:**
+   - **macOS:** Grant microphone and screen recording permissions when prompted
+   - **Windows:** Grant microphone access when prompted. If Windows Defender flags the app, allow it through (it's because of audio/screen capture)
+   - **Linux:** Ensure your user has access to audio devices (usually automatic)
 
 3. **Interact with Halfred:**
 
@@ -293,24 +355,21 @@ python -c "import sounddevice as sd; print(sd.query_devices())"
 ```
 Realtime_HALfred/
 ├── main.py                     # Main application entry point
-├── MCP_SERVERS.json            # MCP server configuration
+├── MCP_SERVERS.json            # MCP server configuration (uses relative paths)
 ├── MCP_SERVERS.json.example    # Example MCP configuration
-├── .env                        # Environment variables (API keys)
-├── .env.example                # Example environment file
+├── .env                        # Environment variables (API keys) - create from .env.example
+├── .env.example                # Example environment file template
 ├── pty_command_safety.py       # PTY command safety module
-├── pty_proxy_mcp.py            # PTY MCP proxy server
-├── filesystem_proxy_mcp.py     # Filesystem MCP proxy server
-├── filesystem_safety.py        # Filesystem safety module
+├── pty_proxy_mcp.py            # PTY MCP proxy server (cross-platform)
 ├── test_pty_safety.py          # PTY safety test suite
-├── test_filesystem_safety.py   # Filesystem safety test suite
-├── config.yaml                 # PTY-mcp-server configuration
-├── requirements.txt            # Python dependencies
+├── config.yaml                 # PTY MCP configuration
+├── requirements.txt            # Python dependencies with platform notes
 ├── .gitignore                  # Git ignore rules
 ├── .gitmodules                 # Git submodule configuration
 ├── README.md                   # This file
-├── ScreenMonitorMCP/           # Screen monitoring MCP server (submodule)
-├── data/                       # Data directory (logs, etc.)
-└── .venv/                      # Python virtual environment
+├── ScreenMonitorMCP/           # Screen monitoring MCP server (git submodule)
+├── data/                       # Data directory (logs, SQLite memory DB)
+└── .venv/                      # Python virtual environment (not in git)
 ```
 
 ## License

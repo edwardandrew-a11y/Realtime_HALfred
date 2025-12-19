@@ -1,10 +1,23 @@
 # Core dependencies for Realtime HALfred
 python-dotenv>=1.0.0
+
+# Audio I/O (requires platform-specific setup - see README)
+# macOS: Works out of box
+# Windows: Requires PortAudio DLL (automatically installed with pip on Windows)
+# Linux: Install libportaudio2 first (apt-get install libportaudio2)
 sounddevice>=0.4.6
+
+# Text-to-Speech via ElevenLabs
 elevenlabs>=1.0.0
 
 # OpenAI Agents SDK for realtime and MCP support
 openai-agents>=0.6.0
 
 # MCP (Model Context Protocol) server support
-mcp>=0.1.0
+mcp>=1.0.0
+
+# Note: ScreenMonitorMCP has additional dependencies.
+# Install separately after cloning submodule:
+#   git submodule update --init
+#   cd ScreenMonitorMCP
+#   pip install -e .
