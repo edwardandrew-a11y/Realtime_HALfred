@@ -14,6 +14,11 @@ sounddevice>=0.4.6
 # Text-to-Speech via ElevenLabs API
 elevenlabs>=1.0.0
 
+# Keyboard input for push-to-talk functionality
+# - Works on macOS, Windows, and Linux
+# - macOS: May require Accessibility permission in System Preferences
+pynput>=1.7.6
+
 # OpenAI Agents SDK (Realtime API + MCP support)
 openai-agents>=0.6.0
 

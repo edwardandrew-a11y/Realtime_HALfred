@@ -16,6 +16,8 @@ Realtime HALfred uses:
 ## Features
 
 - 🎙️ **Continuous Voice Interaction** - Toggle hands-free listening with `/mic` command
+- 🎤 **Push-to-Talk Mode** - Hold Command+Alt (or custom keys) to speak, release to send
+- 🛑 **Speech Interruption** - Interrupt HALfred mid-response with `/stop` or PTT activation
 - 🗣️ **Natural TTS** - ElevenLabs streaming audio for low-latency, natural speech
 - 🎭 **Personality-Driven** - Halfred has a distinct personality: sardonic, helpful, and unfiltered
 - 👁️ **Vision Capabilities** - Screen capture and AI-powered visual analysis through MCP
@@ -260,6 +262,7 @@ pip install -r requirements.txt
 - `openai-agents>=0.6.0` - OpenAI Agents SDK with Realtime API support
 - `elevenlabs>=1.0.0` - ElevenLabs TTS API
 - `sounddevice>=0.4.6` - Cross-platform audio I/O
+- `pynput>=1.7.6` - Keyboard monitoring for push-to-talk functionality
 - `python-dotenv>=1.0.0` - Environment variable management
 - `mcp>=1.0.0` - Model Context Protocol support
 
@@ -357,14 +360,32 @@ python main.py
 ### Commands
 - **Type messages** - Send text messages directly
 - **`/mic`** - Toggle continuous listening mode (hands-free)
+- **`/ptt`** - Toggle push-to-talk mode
+- **`/stop`** - Interrupt HALfred's speech immediately
 - **`/mcp`** - List all available MCP tools and servers
 - **`/quit` or `/exit`** - Exit the program
 
-### Continuous Listening Mode
-When continuous listening is enabled (`/mic`):
+### Voice Interaction Modes
+
+#### Continuous Listening Mode (`/mic`)
+When continuous listening is enabled:
 - Halfred automatically detects when you start and stop speaking (semantic VAD)
 - Microphone automatically mutes while Halfred is speaking (prevents echo)
 - Automatically resumes listening after Halfred finishes responding
+
+#### Push-to-Talk Mode (`/ptt`)
+When push-to-talk is enabled:
+- Hold **Command+Alt** keys (macOS) to record your voice
+- Visual indicator shows when recording: `[ptt] >> RECORDING (keys held)`
+- Release keys to send your message to Halfred
+- Automatically interrupts Halfred's speech when you press the PTT keys
+- Can be customized via `PTT_KEY` in `.env` (options: `cmd_alt`, `space`, `ctrl`, `shift`, etc.)
+
+**macOS Permissions Required:**
+- System Settings → Privacy & Security → Accessibility
+- Grant permission for your Terminal or IDE to monitor keyboard events
+
+**Note:** By default, HALfred starts in continuous listening mode. Use `/ptt` to switch to push-to-talk, and `/mic` to switch back.
 
 ## Architecture
 
@@ -430,6 +451,15 @@ Halfred's personality is defined in `main.py:807-830`. Key traits:
 python -c "import sounddevice as sd; print(sd.query_devices())"
 ```
 
+### Push-to-talk not working
+- **macOS:** Grant Accessibility permission to your Terminal/IDE:
+  - System Settings → Privacy & Security → Accessibility
+  - Add Terminal (or your IDE) to the allowed list
+- Verify pynput is installed: `pip install pynput`
+- Check that PTT is enabled: type `/ptt` in the console
+- Try a different key combination in `.env` if `cmd_alt` doesn't work
+- Check console for `[keyboard]` messages indicating key detection
+
 ### MCP tools not loading
 - Verify ScreenMonitorMCP is properly installed: `cd ScreenMonitorMCP && pip install -e .`
 - Check MCP_SERVERS.json path is correct
@@ -458,6 +488,9 @@ python -c "import sounddevice as sd; print(sd.query_devices())"
 | `ELEVENLABS_VOICE_ID` | No | `2ajXGJNYBR0iNHpS4VZb` | Voice ID for ElevenLabs (default: Rachel) |
 | `USER_NAME` | No | `"the user"` | Your name for personalized interactions |
 | `USER_CONTEXT` | No | `""` | Your occupation, interests, hobbies (e.g., "a med student who likes D&D") |
+| `PTT_ENABLED` | No | `false` | Enable push-to-talk mode on startup |
+| `PTT_KEY` | No | `cmd_alt` | Keys for push-to-talk (`cmd_alt`, `space`, `ctrl`, `shift`, `alt`, or any letter) |
+| `PTT_INTERRUPTS_SPEECH` | No | `true` | Whether PTT activation interrupts HALfred's speech |
 | `MCP_SERVERS_JSON_FILE` | No | `MCP_SERVERS.json` | Path to MCP servers config file |
 | `MCP_CLIENT_TIMEOUT_SECONDS` | No | `30` | Timeout for MCP tool calls |
 | `MCP_DEMO_FILESYSTEM_DIR` | No | - | Optional demo filesystem MCP server |

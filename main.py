@@ -271,8 +271,20 @@ async def init_mcp_servers(stack: AsyncExitStack):
 class ListenState:
     # Small shared flag object tracking whether continuous mic capture is on,
     # so user_input_loop() and event_loop() can coordinate mic start/stop.
-    """Tracks whether the user wants continuous mic listening enabled."""
-    enabled: bool = False
+    """Tracks microphone and push-to-talk state."""
+    enabled: bool = False           # Whether continuous listening is enabled
+    ptt_mode: bool = False          # True if using push-to-talk instead of continuous
+    ptt_active: bool = False        # True while the PTT key is being held
+    ptt_interrupts: bool = True     # Whether PTT should stop HALfred's speech
+
+
+@dataclass
+class PTTState:
+    """Holds push-to-talk keyboard listener and handlers."""
+    keyboard_listener: Optional['KeyboardListener'] = None
+    on_press_callback: Optional[Callable] = None
+    on_release_callback: Optional[Callable] = None
+    ptt_key: str = "cmd_alt"
 
 
 class AudioPlayer:
@@ -451,6 +463,24 @@ class ElevenLabsTTS:
         while self.player.is_playing():
             await asyncio.sleep(0.1)
 
+    def interrupt(self) -> None:
+        """Stop all current speech immediately."""
+        # Clear the text buffer so no new speech starts
+        with self._lock:
+            self.text_buffer = ""
+
+        # Cancel any ongoing TTS generation tasks
+        for task in self._speaking_tasks:
+            if not task.done():
+                task.cancel()
+        self._speaking_tasks.clear()
+
+        # Clear the audio player buffer
+        self.player.clear()
+
+        self.is_speaking = False
+        print("[elevenlabs] Speech interrupted")
+
 
 # Captures microphone audio and feeds it into the realtime session through an asyncio queue.
 class MicStreamer:
@@ -527,21 +557,238 @@ class MicStreamer:
         self.loop.call_soon_threadsafe(self.queue.put_nowait, chunk)
 
 
+class KeyboardListener:
+    """Monitors keyboard for push-to-talk key presses (including modifier combinations)."""
+
+    def __init__(self, ptt_key: str = "space", on_press_callback=None, on_release_callback=None):
+        # Store which key(s) we are watching for
+        self.ptt_key = ptt_key
+        self.is_pressed = False
+        self._listener = None
+        self._on_press_callback = on_press_callback
+        self._on_release_callback = on_release_callback
+
+        # For modifier combinations like "cmd_alt", track which modifiers are currently held
+        self._modifiers_held = set()
+
+        # Parse the key configuration to determine if it's a single key or combination
+        self._is_combination = "_" in ptt_key
+        if self._is_combination:
+            self._required_modifiers = self._parse_combination(ptt_key)
+        else:
+            self._target_key = self._parse_key(ptt_key)
+
+    def _parse_combination(self, combo: str):
+        """Parse a combination like 'cmd_alt' into a set of required modifiers."""
+        from pynput import keyboard
+
+        parts = combo.lower().split("_")
+        modifiers = set()
+
+        key_map = {
+            "cmd": keyboard.Key.cmd,
+            "ctrl": keyboard.Key.ctrl,
+            "shift": keyboard.Key.shift,
+            "alt": keyboard.Key.alt,
+        }
+
+        for part in parts:
+            if part in key_map:
+                modifiers.add(key_map[part])
+            else:
+                print(f"[keyboard] Unrecognized modifier '{part}' in combination")
+
+        return modifiers
+
+    def _parse_key(self, key_name: str):
+        """Convert a key name string to a pynput key object."""
+        from pynput import keyboard
+
+        key_name = key_name.lower().strip()
+
+        # Special keys that pynput handles differently
+        special_keys = {
+            "space": keyboard.Key.space,
+            "ctrl": keyboard.Key.ctrl,
+            "shift": keyboard.Key.shift,
+            "alt": keyboard.Key.alt,
+            "cmd": keyboard.Key.cmd,
+            "tab": keyboard.Key.tab,
+            "enter": keyboard.Key.enter,
+            "backspace": keyboard.Key.backspace,
+            "f1": keyboard.Key.f1,
+            "f2": keyboard.Key.f2,
+            "f3": keyboard.Key.f3,
+            "f4": keyboard.Key.f4,
+            "f5": keyboard.Key.f5,
+            "f6": keyboard.Key.f6,
+            "f7": keyboard.Key.f7,
+            "f8": keyboard.Key.f8,
+            "f9": keyboard.Key.f9,
+            "f10": keyboard.Key.f10,
+            "f11": keyboard.Key.f11,
+            "f12": keyboard.Key.f12,
+        }
+
+        if key_name in special_keys:
+            return special_keys[key_name]
+
+        # For regular letter/number keys, return the character
+        if len(key_name) == 1:
+            return key_name
+
+        # Default to space if unrecognized
+        print(f"[keyboard] Unrecognized PTT key '{key_name}', defaulting to space")
+        return keyboard.Key.space
+
+    def _check_combination_active(self) -> bool:
+        """Check if all required modifiers are currently held."""
+        return self._required_modifiers.issubset(self._modifiers_held)
+
+    def _matches_target(self, key) -> bool:
+        """Check if the pressed key matches our target PTT key."""
+        from pynput import keyboard
+
+        # If target is a special key (like Key.space)
+        if isinstance(self._target_key, keyboard.Key):
+            return key == self._target_key
+
+        # If target is a character (like 'a')
+        if hasattr(key, 'char') and key.char is not None:
+            return key.char.lower() == self._target_key
+
+        return False
+
+    def _on_press(self, key):
+        """Called when any key is pressed."""
+        from pynput import keyboard
+
+        # Track modifier keys
+        if key in {keyboard.Key.cmd, keyboard.Key.ctrl, keyboard.Key.shift, keyboard.Key.alt}:
+            self._modifiers_held.add(key)
+
+        # For combinations, check if all required modifiers are now held
+        if self._is_combination:
+            if self._check_combination_active() and not self.is_pressed:
+                self.is_pressed = True
+                if self._on_press_callback:
+                    self._on_press_callback()
+        # For single keys, check if the key matches
+        elif self._matches_target(key) and not self.is_pressed:
+            self.is_pressed = True
+            if self._on_press_callback:
+                self._on_press_callback()
+
+    def _on_release(self, key):
+        """Called when any key is released."""
+        from pynput import keyboard
+
+        # Track modifier keys being released
+        if key in {keyboard.Key.cmd, keyboard.Key.ctrl, keyboard.Key.shift, keyboard.Key.alt}:
+            self._modifiers_held.discard(key)
+
+        # For combinations, check if we no longer have all required modifiers
+        if self._is_combination:
+            if not self._check_combination_active() and self.is_pressed:
+                self.is_pressed = False
+                if self._on_release_callback:
+                    self._on_release_callback()
+        # For single keys, check if the released key matches
+        elif self._matches_target(key) and self.is_pressed:
+            self.is_pressed = False
+            if self._on_release_callback:
+                self._on_release_callback()
+
+    def start(self):
+        """Start listening for keyboard events."""
+        from pynput import keyboard
+
+        self._listener = keyboard.Listener(
+            on_press=self._on_press,
+            on_release=self._on_release
+        )
+        self._listener.start()
+        print(f"[keyboard] Push-to-talk listener started (key: {self.ptt_key})")
+
+    def stop(self):
+        """Stop listening for keyboard events."""
+        if self._listener:
+            self._listener.stop()
+            self._listener = None
+
+
 async def mic_send_loop(session, mic: MicStreamer):
     # Bridge between MicStreamer and the RealtimeAgent session (agents/realtime.py):
     # forwards mic audio chunks to the session so the model can transcribe them.
     """Continuously send mic audio to the realtime session.
 
-    When `None` is received, we send a tiny silence frame with commit=True to
+    When `None` is received, we send silence frames with commit=True to
     force the server to finalize the user turn.
     """
     while True:
         chunk = await mic.queue.get()
         if chunk is None:
-            # Commit the buffered audio (one int16 sample of silence).
-            await session.send_audio(b"\x00\x00", commit=True)
+            # Send a longer silence period (0.5 seconds at 24kHz, mono, 16-bit = 24000 samples = 48000 bytes)
+            # to help semantic VAD detect the end of speech
+            silence_duration_samples = 12000  # 0.5 seconds at 24kHz
+            silence_bytes = b"\x00" * (silence_duration_samples * 2)  # 2 bytes per int16 sample
+            await session.send_audio(silence_bytes, commit=True)
             continue
         await session.send_audio(chunk)
+
+
+def create_ptt_handlers(
+    mic: MicStreamer,
+    player: AudioPlayer,
+    tts: Optional[ElevenLabsTTS],
+    listen_state: ListenState,
+    session,
+    loop: asyncio.AbstractEventLoop
+):
+    """Create callback functions for push-to-talk key press and release.
+
+    Returns two functions: one for when the key is pressed, one for when released.
+    """
+
+    def on_ptt_press():
+        """Called when the push-to-talk key is pressed down."""
+        if not listen_state.ptt_mode:
+            return  # PTT mode not enabled
+
+        listen_state.ptt_active = True
+        print("\n[ptt] >> RECORDING (keys held) - speak now...")
+
+        # If configured, interrupt any current speech (only if actually speaking)
+        if listen_state.ptt_interrupts:
+            # Check if there's actually audio playing or speech being generated
+            is_speaking = (tts is not None and (tts.is_speaking or player.is_playing()))
+
+            if is_speaking:
+                if tts is not None:
+                    tts.interrupt()
+                print("[ptt] << Speech interrupted")
+
+                # Also tell OpenAI to stop its current response
+                loop.call_soon_threadsafe(
+                    lambda: asyncio.create_task(session.interrupt())
+                )
+
+        # Start the microphone
+        mic.start()
+
+    def on_ptt_release():
+        """Called when the push-to-talk key is released."""
+        if not listen_state.ptt_mode:
+            return  # PTT mode not enabled
+
+        listen_state.ptt_active = False
+        print("[ptt] << Keys released - processing your speech...\n")
+
+        # Stop the microphone and commit the audio (send it for processing)
+        # With turn detection disabled, the commit signal triggers response generation
+        mic.stop(commit=True)
+
+    return on_ptt_press, on_ptt_release
 
 
 @function_tool
@@ -552,7 +799,7 @@ def local_time() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-async def user_input_loop(session, mic: MicStreamer, player: AudioPlayer, listen_state: ListenState, mcp_servers):
+async def user_input_loop(session, mic: MicStreamer, player: AudioPlayer, listen_state: ListenState, mcp_servers, ptt_state: PTTState, tts: Optional[ElevenLabsTTS] = None):
     # Handles console input from the user. It controls mic state, lists MCP tools,
     # and exposes DEV_MODE shortcuts that call helpers in automation_safety.py
     # (e.g., take_screenshot, test_highlight) against the configured MCP servers.
@@ -560,7 +807,7 @@ async def user_input_loop(session, mic: MicStreamer, player: AudioPlayer, listen
     dev_cmds = ""
     if os.getenv("DEV_MODE", "false").lower() == "true":
         dev_cmds = ", /screeninfo, /screenshot [full|active], /highlight x y w h, /confirm_test, /demo_click"
-    print(f"\nType messages. Commands: /mic (toggle continuous listen), /mcp (list MCP tools), /quit{dev_cmds}\n")
+    print(f"\nType messages. Commands: /mic (continuous listen), /ptt (push-to-talk), /stop (interrupt speech), /mcp (list tools), /quit{dev_cmds}\n")
     # Keep reading commands/messages from stdin without blocking the event loop.
     while True:
         msg = await asyncio.to_thread(input, "You> ")
@@ -587,6 +834,51 @@ async def user_input_loop(session, mic: MicStreamer, player: AudioPlayer, listen
                 await session.interrupt()   # Stop any current AI speech
                 player.clear()
                 mic.start()     # Start capturing user's speech
+            continue
+
+        if msg.lower() == "/ptt":
+            # Toggle push-to-talk mode
+            if listen_state.ptt_mode:
+                # Turn off PTT mode
+                listen_state.ptt_mode = False
+                listen_state.enabled = False
+                mic.stop(commit=False)
+
+                # Stop the keyboard listener
+                if ptt_state.keyboard_listener:
+                    ptt_state.keyboard_listener.stop()
+                    ptt_state.keyboard_listener = None
+
+                print("[ptt] Push-to-talk mode OFF")
+                print("      Use /mic for continuous listening, or /ptt to re-enable PTT")
+            else:
+                # Disable continuous mode if it was on
+                if listen_state.enabled:
+                    listen_state.enabled = False
+                    mic.stop(commit=False)
+
+                listen_state.ptt_mode = True
+
+                # Create and start the keyboard listener
+                if not ptt_state.keyboard_listener:
+                    ptt_state.keyboard_listener = KeyboardListener(
+                        ptt_key=ptt_state.ptt_key,
+                        on_press_callback=ptt_state.on_press_callback,
+                        on_release_callback=ptt_state.on_release_callback
+                    )
+                ptt_state.keyboard_listener.start()
+
+                print(f"[ptt] Push-to-talk mode ON")
+                print(f"      Hold '{ptt_state.ptt_key}' keys to speak")
+                print(f"      Release keys to send your message")
+            continue
+
+        if msg.lower() == "/stop":
+            # Interrupt HALfred's current speech
+            if tts:
+                tts.interrupt()
+            await session.interrupt()
+            print("[stop] Speech interrupted")
             continue
 
         if msg.lower() == "/mcp":
@@ -847,6 +1139,11 @@ async def main():
                 agent_tools.append(safe_action)
                 print("[automation_safety] safe_action tool registered")
 
+            # Load push-to-talk configuration (needs to be early to configure turn detection)
+            ptt_enabled = os.getenv("PTT_ENABLED", "false").lower() == "true"
+            ptt_key = os.getenv("PTT_KEY", "cmd_alt")
+            ptt_interrupts = os.getenv("PTT_INTERRUPTS_SPEECH", "true").lower() == "true"
+
             # Create the OpenAI RealtimeAgent (agents/realtime.py) with our persona,
             # tool list, and MCP servers to delegate tool calls.
             agent = RealtimeAgent(
@@ -860,6 +1157,10 @@ async def main():
             # OpenAI's gpt-realtime model. We disable audio output here because we stream
             # the assistant's text to ElevenLabs for speech.
             # The quickstart shows model_name 'gpt-realtime' and typical audio/transcription/turn detection settings.  [oai_citation:6‡OpenAI GitHub Pages](https://openai.github.io/openai-agents-python/realtime/quickstart/)
+
+            # Turn detection: Always enabled for both PTT and continuous modes
+            # In PTT mode, we manually control when audio is sent, but VAD still detects end of speech
+            # In continuous mode, VAD detects both start and end of speech automatically
             runner = RealtimeRunner(
                 starting_agent=agent,
                 config={  # type: ignore[arg-type]
@@ -871,12 +1172,12 @@ async def main():
                         "input_audio_noise_reduction": {
                             "type": "near_field"  # or "far_field" or null to disable
                         },
-                        # Let the server detect turns; we still "commit" on /mic stop to be safe.
+                        # Turn detection enabled for both PTT and continuous modes
                         "turn_detection": {
-                            "type": "semantic_vad", # or "server_vad" or null (disable)
-                            "eagerness": "medium",  # "low", "medium", "high", or "auto" (let's the model decide)
+                            "type": "semantic_vad",
+                            "eagerness": "medium",
                             "create_response": True,
-                            "interrupt_response": False,    # Allow interruptions
+                            "interrupt_response": True,
                         },
                         # Optional: get transcripts of the user's audio for debugging.
                         "input_audio_transcription": {"model": "whisper-1"},
@@ -902,15 +1203,54 @@ async def main():
             mic = MicStreamer(
                 loop=asyncio.get_running_loop(),
                 samplerate=24000,
-                mute_fn=lambda: player.is_playing(),
+                mute_fn=None,    # set to 'lambda: player.is_playing()' to mute mic during elevenlabs playback
             )
             listen_state = ListenState()
+
+            # Load push-to-talk configuration
+            ptt_enabled = os.getenv("PTT_ENABLED", "false").lower() == "true"
+            ptt_key = os.getenv("PTT_KEY", "cmd_alt")
+            ptt_interrupts = os.getenv("PTT_INTERRUPTS_SPEECH", "true").lower() == "true"
+
+            # Create push-to-talk handlers
+            on_ptt_press, on_ptt_release = create_ptt_handlers(
+                mic=mic,
+                player=player,
+                tts=tts,
+                listen_state=listen_state,
+                session=session,
+                loop=asyncio.get_running_loop()
+            )
+
+            # Set up the listen state for PTT mode
+            listen_state.ptt_mode = ptt_enabled
+            listen_state.ptt_interrupts = ptt_interrupts
+
+            # Initialize keyboard listener if PTT is enabled
+            keyboard_listener = None
+            if ptt_enabled:
+                keyboard_listener = KeyboardListener(
+                    ptt_key=ptt_key,
+                    on_press_callback=on_ptt_press,
+                    on_release_callback=on_ptt_release
+                )
+                keyboard_listener.start()
+                print(f"[ptt] Push-to-talk enabled (hold '{ptt_key}' keys to speak)")
+
+            # Create PTTState to pass to user_input_loop
+            ptt_state = PTTState(
+                keyboard_listener=keyboard_listener,
+                on_press_callback=on_ptt_press,
+                on_release_callback=on_ptt_release,
+                ptt_key=ptt_key
+            )
+
             try:
                 async with session:
                     print("✅ Realtime session started (using ElevenLabs TTS).")
                     # Run console input, event handling, and mic streaming at the same time.
                     # These tasks all share the session/player/mic/tts objects defined above.
-                    t1 = asyncio.create_task(user_input_loop(session, mic, player, listen_state, mcp_servers))
+                    t1 = asyncio.create_task(user_input_loop(session, mic, player, listen_state, mcp_servers, ptt_state, tts))
                     t2 = asyncio.create_task(event_loop(session, player, mic, listen_state, tts))
                     t3 = asyncio.create_task(mic_send_loop(session, mic))
                     done, pending = await asyncio.wait({t1, t2, t3}, return_when=asyncio.FIRST_COMPLETED)
@@ -918,6 +1258,8 @@ async def main():
                         task.cancel()
             finally:
                 # Ensure hardware resources are released even if tasks error out.
+                if ptt_state.keyboard_listener:
+                    ptt_state.keyboard_listener.stop()
                 try:
                     mic.stop(commit=False)
                     mic.close()
