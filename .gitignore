@@ -1,6 +1,7 @@
 # Environment and secrets
 .env
 MCP_SERVERS.json
+AGENTS.md
 
 # Python
 __pycache__/

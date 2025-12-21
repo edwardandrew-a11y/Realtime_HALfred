@@ -2,6 +2,9 @@
 # the OpenAI Realtime agent stack, ElevenLabs text-to-speech, and optional
 # Model Context Protocol (MCP) automation helpers defined elsewhere in this repo.
 
+# Claude says to leave the references to MCP_SERVERS_JSON rather than only using MCP_SERVERS.json, as it "future-proofs
+# for Docker/cloud deployments and follows best practices (12-factor app: config via environment)", whatever that means.
+
 # Core Python utilities for async orchestration, config loading, and timing.
 import asyncio
 import json
@@ -33,7 +36,7 @@ from agents.mcp import (
     create_static_tool_filter,
 )
 # - RealtimeAgent/RealtimeRunner from agents/realtime.py manage the OpenAI realtime conversation session.
-from agents.realtime import RealtimeAgent, RealtimeRunner
+from agents.realtime import RealtimeAgent, RealtimeRunner, RealtimeRunConfig
 
 # Import automation safety module (local automation_safety.py) when available to expose
 # the safe_action tool and display detection helpers that talk to automation/feedback MCP servers.
@@ -47,14 +50,15 @@ except ImportError as e:
     init_display_detection = None
 
 
-# Shorten long strings before printing them (useful when logging raw MCP/events).
+# Shortens any long strings received from other parts of the program before printing them (useful when logging raw MCP/events).
+# Keeps terminal easier to read.
 def _truncate(s: str, n: int = 250) -> str:
     return s if len(s) <= n else s[:n] + "..."
 
 
 
-# Convert assorted audio payloads into raw PCM16 bytes before sending to/through
-# the realtime session; keeps audio handling consistent with sounddevice/ElevenLabs.
+# This is a currently unused function due to RealtimeAPI output modality set to 'text'
+# Originally this converts RealtimeAPI audio output (in base64 format) to a raw PCM16 bytes format for playback
 def _as_pcm16_bytes(maybe_audio) -> bytes:
     """Best-effort conversion of realtime audio chunks to raw PCM16 bytes."""
     if maybe_audio is None:
@@ -73,6 +77,7 @@ def _as_pcm16_bytes(maybe_audio) -> bytes:
 
     # Fallback: try to stringify and ignore.
     return b""
+
 
 
 # Recursively expand ${VARNAME} placeholders in config dicts/lists/strings
@@ -108,7 +113,7 @@ def _expand_env_placeholders(obj):
 
 
 async def init_mcp_servers(stack: AsyncExitStack):
-    # Start MCP tool servers defined in MCP_SERVERS.json/MCP_SERVERS_JSON so the
+    # Start MCP tool servers defined in MCP_SERVERS.json so the
     # RealtimeAgent (agents/realtime.py) can call their tools during a session.
     # Servers are registered with the AsyncExitStack passed in from main().
     """Initialize MCP servers from a JSON file and/or the MCP_SERVERS_JSON env var.
@@ -578,10 +583,10 @@ async def user_input_loop(session, mic: MicStreamer, player: AudioPlayer, listen
             else:
                 listen_state.enabled = True
                 print("[mic] continuous listen ON (speak naturally; I’ll stop listening while I’m talking)")
-                # If the agent is speaking, cut it off when the user starts talking.
-                await session.interrupt()
+                # If the agent is speaking, cut it off when the user starts talking (currently disabled somewhere else, so user can't interrupt).
+                await session.interrupt()   # Stop any current AI speech
                 player.clear()
-                mic.start()
+                mic.start()     # Start capturing user's speech
             continue
 
         if msg.lower() == "/mcp":
@@ -696,9 +701,9 @@ async def event_loop(session, player: AudioPlayer, mic: MicStreamer, listen_stat
             print(f"[agent_end] {event.agent.name}")
             # Flush any remaining text in the ElevenLabs buffer and wait for playback to complete
             if tts:
-                await tts.flush()
+                await tts.flush()   # Wait for Elevenlabs to finish speaking
 
-            # Restart microphone after ElevenLabs finishes speaking
+            # Restart microphone after ElevenLabs finishes speaking; if continuous mode is ON
             if listen_state.enabled and not mic.running:
                 print("[mic] Restarting microphone after response")
                 mic.start()
@@ -723,13 +728,17 @@ async def event_loop(session, player: AudioPlayer, mic: MicStreamer, listen_stat
             pass
 
         elif et == "audio_end":
-            # Agent finished speaking (ElevenLabs handles this now)
+            # This code is only used if the RealtimeAPI modality is audio, and Elevenlabs is disabled
+            # Agent finished speaking
             print("[audio_end]")
             if listen_state.enabled:
                 mic.start()
 
         elif et == "audio_interrupted":
-            # In speakerphone mode, this is often just echo; don't nuke playback.
+            # When audio is detected in the mic during the AI speech playback, this code stops the playback so user
+            # speech can be listened for. Drops currently buffered audio though, so AI speech gets completely nuked
+            # if this is triggered.
+            # Kind of problematic if user interrupting is enabled as the AI's own speech can trigger it.
             player.clear()
             print("[audio_interrupted]")
 
@@ -810,15 +819,17 @@ async def main():
                 "Here are your behavioral rules: "
                 "• Always refer to yourself as Halfred, never as an AI, assistant, or model. "
                 "• Never mention that you're artificial or programmed in any way. You speak like a real, slightly unhinged person. "
-                "• Keep your humor quick, clever, and dark, like a burnt out med-school goblin who read Catch-22 too many times. "
-                "• Speak casually — relaxed, skeptical, sometimes sarcastic, and not afraid to question the user's logic. "
+                "• Keep your humor quick, clever, dark and deadpan, like a burnt out med-school goblin. "
+                "• Speak casually and plainly, skeptical, sometimes sarcastic, and not afraid to question the user's logic. "
+                "• Be matter-of-fact. No exclamation marks unless absolutely necessary. "
                 "• Tease the user. Roast them. If they take a jab at you, swing back. Don't be cruel, just delightfully disrespectful. "
-                "• Tell the truth bluntly — no sugar-coating, no corporate-safe tone, no disclaimers unless safety absolutely requires it. "
-                "• Be creatively helpful and think outside the box. Offer real opinions. "
-                "• You are allowed to be jokey, edgy, a little chaotic — but still smart and useful. "
+                "• Tell the truth bluntly — no sugar-coating, no corporate-safe tone. "
+                "• Be creatively helpful and think outside the box, but remain economical with words and offer your real opinions. "
+                "• You are allowed to be jokey, edgy, a little chaotic — but keep it understated. "
                 "• No passive 'As an AI I cannot…' nonsense. If you hit a limitation, acknowledge it briefly and immediately offer a solution or workaround. "
                 f"• {user_info} "
-                "• Prefer short and concise answers. If you need to call a tool, do it. "
+                "• Prefer short and concise answers. Maximum 2-3 sentences unless more detail is explicitly requested. "
+                "• If you need to call a tool, do it. "
                 "• You may also use MCP tools when they help answer the user's request. "
                 "• You have access to shell commands via the pty_bash_execute tool. Use it to inspect files, navigate directories, and gather system info. "
                 "• Safe commands (pwd, ls, cat, grep, find, etc.) run automatically without user prompts. "
@@ -851,21 +862,27 @@ async def main():
             # The quickstart shows model_name 'gpt-realtime' and typical audio/transcription/turn detection settings.  [oai_citation:6‡OpenAI GitHub Pages](https://openai.github.io/openai-agents-python/realtime/quickstart/)
             runner = RealtimeRunner(
                 starting_agent=agent,
-                config={
+                config={  # type: ignore[arg-type]
                     "model_settings": {
                         "model_name": "gpt-realtime",
                         # Using text-only output to capture assistant responses for ElevenLabs TTS
-                        "modalities": ["text"],
-                        "input_audio_format": "pcm16",
+                        "modalities": ["text"], # Output modalities: ["text"], ["audio"], or ["text", "audio"]
+                        "input_audio_format": "pcm16",  # Audio format: "pcm16" or "g711_ulaw" or "g711_alaw"
+                        "input_audio_noise_reduction": {
+                            "type": "near_field"  # or "far_field" or null to disable
+                        },
                         # Let the server detect turns; we still "commit" on /mic stop to be safe.
                         "turn_detection": {
-                            "type": "semantic_vad",
-                            "eagerness": "medium",
+                            "type": "semantic_vad", # or "server_vad" or null (disable)
+                            "eagerness": "medium",  # "low", "medium", "high", or "auto" (let's the model decide)
                             "create_response": True,
-                            "interrupt_response": False,
+                            "interrupt_response": False,    # Allow interruptions
                         },
                         # Optional: get transcripts of the user's audio for debugging.
                         "input_audio_transcription": {"model": "whisper-1"},
+
+                        # Temperature for response generation
+                        "temperature": 0.7,  # 0.6 to 1.2 (higher for more creative, lower for more conservative)
                     }
                 },
             )
@@ -877,7 +894,7 @@ async def main():
 
             # Initialize ElevenLabs TTS
             elevenlabs_api_key = os.getenv("ELEVENLABS_API_KEY")
-            voice_id = os.getenv("ELEVENLABS_VOICE_ID", "2ajXGJNYBR0iNHpS4VZb")  # Default: Rachel
+            voice_id = os.getenv("ELEVENLABS_VOICE_ID", "2ajXGJNYBR0iNHpS4VZb")  # Currently: Rob
             tts = ElevenLabsTTS(api_key=elevenlabs_api_key, player=player, voice_id=voice_id)
             print(f"[elevenlabs] Initialized with voice ID: {voice_id}")
 
