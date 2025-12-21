@@ -1,0 +1,28 @@
+{
+  "name": "realtime-halfred",
+  "version": "0.6.0",
+  "description": "Desktop automation dependencies for Realtime HALfred",
+  "dependencies": {
+    "automation-mcp": "github:ashwwwin/automation-mcp",
+    "feedback-loop-mcp": "^1.0.0"
+  },
+  "devDependencies": {},
+  "scripts": {
+    "postinstall": "echo 'MCP servers installed. Run with bun/npx.'"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/andrewhuckleby/Realtime_HALfred"
+  },
+  "keywords": [
+    "mcp",
+    "automation",
+    "desktop-automation",
+    "human-in-the-loop"
+  ],
+  "author": "Andrew Huckleby",
+  "license": "MIT"
+}

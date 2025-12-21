@@ -11,7 +11,7 @@
       }
     },
     "client_session_timeout_seconds": 30,
-    "comment": "Requires ScreenMonitorMCP submodule: git submodule update --init && cd ScreenMonitorMCP && pip install -e ."
+    "comment": "✅ STABLE - Screen monitoring with AI vision. Requires: git submodule update --init && cd ScreenMonitorMCP && pip install -e ."
   },
   {
     "name": "pty-proxy",
@@ -21,6 +21,28 @@
       "args": ["pty_proxy_mcp.py"]
     },
     "client_session_timeout_seconds": 60,
-    "comment": "Terminal command execution with safety controls. Works on Windows (cmd.exe), macOS, and Linux (bash)."
+    "comment": "✅ STABLE - Terminal command execution with safety controls. Works on Windows (cmd.exe), macOS, and Linux (bash)."
+  },
+  {
+    "name": "automation",
+    "transport": "stdio",
+    "params": {
+      "command": "bun",
+      "args": ["run", "node_modules/automation-mcp/index.ts", "--stdio"],
+      "env": {}
+    },
+    "client_session_timeout_seconds": 600,
+    "comment": "⚠️ EXPERIMENTAL - Desktop automation with 20 tools (mouseClick, type, screenshot, etc.). Requires: (1) bun runtime, (2) npm install, (3) FastMCP patch (see docs/FASTMCP_PATCH.md), (4) macOS permissions (Accessibility + Screen Recording). Only loads if ENABLE_AUTOMATION_MCP=true in .env"
+  },
+  {
+    "name": "feedback-loop",
+    "transport": "stdio",
+    "params": {
+      "command": "npx",
+      "args": ["feedback-loop-mcp"],
+      "env": {}
+    },
+    "client_session_timeout_seconds": 600,
+    "comment": "⚠️ EXPERIMENTAL - Human-in-the-loop confirmation UI with native macOS overlay. Only loads if ENABLE_FEEDBACK_LOOP_MCP=true in .env. May not work on all macOS versions."
   }
 ]

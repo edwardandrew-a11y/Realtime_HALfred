@@ -23,6 +23,26 @@ Realtime HALfred uses:
 - 🔧 **Extensible Tools** - MCP integration allows adding new capabilities easily
 - 🎧 **Half-Duplex Audio** - Automatic mic muting during playback to prevent echo
 
+## ⚠️ Important Notes
+
+### Core Features (Stable)
+The following features have been extensively tested and are production-ready:
+- ✅ Voice interaction (OpenAI Realtime API + ElevenLabs TTS)
+- ✅ Screen monitoring (ScreenMonitorMCP)
+- ✅ PTY terminal access (pty-proxy-mcp)
+
+### Experimental Features (Use with Caution)
+The following features are **experimental** and have not been fully tested:
+- ⚠️ **Desktop Automation (automation-mcp)** - May have compatibility issues, requires FastMCP patch
+- ⚠️ **Feedback Loop UI (feedback-loop-mcp)** - Not fully tested across all macOS versions
+- ⚠️ **PyAutoGUI Fallback** - Limited testing on Windows/Linux
+
+**Recommendations:**
+- Test automation features in a safe environment first
+- Use `DEV_MODE=true` and test commands (`/demo_click`, `/screeninfo`) before real usage
+- Keep `AUTOMATION_REQUIRE_APPROVAL=true` to maintain safety
+- Report issues to the project's GitHub issues page
+
 ## Available Tools
 
 ### Built-in Tools
@@ -71,6 +91,92 @@ Halfred has safe terminal access through the PTY proxy:
 - **macOS/Linux:** Uses `/bin/bash` for command execution
 - **Windows:** Uses `cmd.exe` for command execution
 - Safety controls work identically across all platforms
+
+### MCP Tools (Desktop Automation) ⚠️ EXPERIMENTAL
+
+**⚠️ WARNING: This feature is experimental and not fully tested. Use with caution.**
+
+Halfred can control your computer with built-in safety confirmations:
+
+**`safe_action`** - Execute desktop automation actions with human-in-the-loop confirmation
+
+**Supported Actions:**
+- **Click/Double-click** - Click at specific screen coordinates
+- **Type** - Type text into active window
+- **Hotkeys** - Execute keyboard shortcuts (cmd+c, ctrl+v, etc.)
+- **Window Control** - Focus and manage application windows
+- **Screenshots** - Capture screen content (read-only, no confirmation)
+- **Screen Info** - Query screen dimensions and window positions (read-only)
+
+**Safety Flow:**
+1. 📸 Takes a screenshot for context
+2. 🎯 Highlights the target region on screen
+3. ⏳ Requests confirmation via native overlay UI
+4. ✅ Executes action only if approved
+
+**Example Usage:**
+```
+You> Click the Safari icon in my dock
+```
+Halfred will:
+- Identify the Safari icon location
+- Show you a highlighted screenshot
+- Ask for confirmation via overlay
+- Click only if you approve
+
+**Implementation:**
+- **Automation Backend:** automation-mcp (20 tools - mouseClick, type, screenshot, window control, etc.)
+- **Confirmation UI:** feedback-loop-mcp (native macOS overlay)
+- **Safety Wrapper:** automation_safety.py (orchestrates both)
+- **Fallback:** PyAutoGUI (if automation-mcp unavailable)
+
+**⚠️ Known Issues:**
+- automation-mcp requires a FastMCP compatibility patch (see docs/FASTMCP_PATCH.md)
+- feedback-loop-mcp may not work on all macOS versions
+- Patch may be lost when running `npm install` or `npm update`
+- Limited testing on production environments
+
+**Platform Support:**
+- **macOS:** Partial support (automation-mcp with FastMCP patch + overlay confirmations - EXPERIMENTAL)
+- **Windows/Linux:** Fallback to PyAutoGUI (minimal testing)
+
+**Configuration:**
+```bash
+# Enable in .env (OPTIONAL - these features are experimental)
+ENABLE_AUTOMATION_MCP=false  # Set to true only after reviewing docs/AUTOMATION.md
+ENABLE_FEEDBACK_LOOP_MCP=false  # Set to true only after testing
+AUTOMATION_REQUIRE_APPROVAL=true  # Safety: always confirm before actions
+DEV_MODE=true  # Recommended for testing automation features
+```
+
+**Installation (Optional - for automation features only):**
+```bash
+# Install Bun runtime (for automation-mcp)
+curl -fsSL https://bun.sh/install | bash
+
+# Install Node.js dependencies (automation-mcp + feedback-loop-mcp)
+npm install
+# or
+bun install
+
+# Install PyAutoGUI fallback (optional, for Windows/Linux)
+pip install pyautogui
+
+# On macOS: Grant permissions in System Preferences → Security & Privacy
+# - Accessibility (for mouse/keyboard control)
+# - Screen Recording (for screenshots and highlighting)
+```
+
+**Developer Commands** (enable with `DEV_MODE=true`):
+- `/screeninfo` - Display screen dimensions
+- `/screenshot [full|active]` - Capture screen
+- `/highlight x y w h` - Test highlight overlay
+- `/confirm_test` - Test feedback loop UI
+- `/demo_click` - Full safety demo
+
+📚 **See [docs/AUTOMATION.md](docs/AUTOMATION.md) for detailed setup, usage, and troubleshooting guide.**
+
+⚠️ **IMPORTANT: Test these features thoroughly in a safe environment before production use. Always keep AUTOMATION_REQUIRE_APPROVAL=true unless you have a specific automation use case.**
 
 ## Setup
 
@@ -300,7 +406,7 @@ When continuous listening is enabled (`/mic`):
 
 ## Personality
 
-Halfred's personality is defined in `main.py:639-657`. Key traits:
+Halfred's personality is defined in `main.py:807-830`. Key traits:
 - Refers to himself as "Halfred," never as an AI or assistant
 - Quick, clever, and darkly humorous
 - Casual, skeptical, and sometimes sarcastic
@@ -329,6 +435,15 @@ python -c "import sounddevice as sd; print(sd.query_devices())"
 - Check MCP_SERVERS.json path is correct
 - Ensure OpenAI API key is set in environment
 
+### Automation features not working
+- ⚠️ These features are experimental and may have issues
+- Check that `ENABLE_AUTOMATION_MCP=true` and `ENABLE_FEEDBACK_LOOP_MCP=true` in `.env`
+- Verify Bun runtime is installed: `bun --version`
+- Check macOS permissions: System Preferences → Security & Privacy → Privacy
+- Review the FastMCP patch: see docs/FASTMCP_PATCH.md
+- Test with DEV_MODE commands first: `/demo_click`, `/screeninfo`
+- If issues persist, use fallback: `pip install pyautogui`
+
 ### High latency
 - ElevenLabs uses `optimizeStreamingLatency: 3` (max optimization)
 - Check network connection stability
@@ -349,6 +464,12 @@ python -c "import sounddevice as sd; print(sd.query_devices())"
 | `PTY_REQUIRE_APPROVAL` | No | `true` | Require user confirmation for risky shell commands |
 | `PTY_SAFE_COMMANDS` | No | See `.env.example` | Comma-separated list of safe commands |
 | `FILESYSTEM_REQUIRE_APPROVAL` | No | `true` | Require user confirmation for risky file operations |
+| `ENABLE_AUTOMATION_MCP` | No | `false` | Enable desktop automation features |
+| `ENABLE_FEEDBACK_LOOP_MCP` | No | `false` | Enable feedback loop confirmation UI |
+| `AUTOMATION_MCP_TIMEOUT` | No | `600` | Timeout for automation tool calls (seconds) |
+| `AUTOMATION_REQUIRE_APPROVAL` | No | `true` | Require confirmation for state-changing actions |
+| `PREFERRED_DISPLAY_INDEX` | No | `0` | For dual monitors: which display to use (0=primary) |
+| `DEV_MODE` | No | `false` | Enable developer debug commands |
 
 ## Project Structure
 
@@ -362,13 +483,21 @@ Realtime_HALfred/
 ├── pty_command_safety.py       # PTY command safety module
 ├── pty_proxy_mcp.py            # PTY MCP proxy server (cross-platform)
 ├── test_pty_safety.py          # PTY safety test suite
+├── automation_safety.py        # Desktop automation safety wrapper
+├── test_automation_mcp.py      # Automation MCP smoke tests
+├── package.json                # Node.js dependencies (automation-mcp, feedback-loop-mcp)
 ├── config.yaml                 # PTY MCP configuration
 ├── requirements.txt            # Python dependencies with platform notes
 ├── .gitignore                  # Git ignore rules
 ├── .gitmodules                 # Git submodule configuration
 ├── README.md                   # This file
+├── docs/
+│   ├── AUTOMATION.md           # Desktop automation user guide
+│   ├── AUTOMATION_IMPLEMENTATION.md  # Technical implementation details
+│   └── FASTMCP_PATCH.md        # FastMCP compatibility patch documentation
 ├── ScreenMonitorMCP/           # Screen monitoring MCP server (git submodule)
 ├── data/                       # Data directory (logs, SQLite memory DB)
+├── node_modules/               # Node.js packages (automation-mcp, feedback-loop-mcp)
 └── .venv/                      # Python virtual environment (not in git)
 ```
 

@@ -1,23 +1,42 @@
-# Core dependencies for Realtime HALfred
+# ========================================
+# Realtime HALfred - Core Dependencies
+# ========================================
+
+# Environment configuration
 python-dotenv>=1.0.0
 
 # Audio I/O (requires platform-specific setup - see README)
-# macOS: Works out of box
-# Windows: Requires PortAudio DLL (automatically installed with pip on Windows)
-# Linux: Install libportaudio2 first (apt-get install libportaudio2)
+# - macOS: Works out of the box (Core Audio)
+# - Windows: PortAudio DLL automatically installed with pip
+# - Linux: Install libportaudio2 first (apt-get install libportaudio2)
 sounddevice>=0.4.6
 
-# Text-to-Speech via ElevenLabs
+# Text-to-Speech via ElevenLabs API
 elevenlabs>=1.0.0
 
-# OpenAI Agents SDK for realtime and MCP support
+# OpenAI Agents SDK (Realtime API + MCP support)
 openai-agents>=0.6.0
 
 # MCP (Model Context Protocol) server support
 mcp>=1.0.0
 
-# Note: ScreenMonitorMCP has additional dependencies.
-# Install separately after cloning submodule:
-#   git submodule update --init
+# ========================================
+# Optional Dependencies
+# ========================================
+
+# PyAutoGUI - Optional fallback for desktop automation on Windows/Linux
+# Only needed if ENABLE_AUTOMATION_MCP=true and automation-mcp is unavailable
+# Install with: pip install pyautogui
+# Note: automation-mcp (via npm/bun) is preferred for macOS
+# pyautogui>=0.9.54
+
+# ========================================
+# Submodule Dependencies
+# ========================================
+
+# ScreenMonitorMCP - Install separately after cloning submodule:
+#   git submodule update --init --recursive
 #   cd ScreenMonitorMCP
 #   pip install -e .
+#
+# This provides AI vision and screen monitoring capabilities (✅ STABLE)
