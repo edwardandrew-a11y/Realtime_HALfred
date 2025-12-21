@@ -808,8 +808,19 @@ async def user_input_loop(session, mic: MicStreamer, player: AudioPlayer, listen
     if os.getenv("DEV_MODE", "false").lower() == "true":
         dev_cmds = ", /screeninfo, /screenshot [full|active], /highlight x y w h, /confirm_test, /demo_click"
     print(f"\nType messages. Commands: /mic (continuous listen), /ptt (push-to-talk), /stop (interrupt speech), /mcp (list tools), /quit{dev_cmds}\n")
+
+    def show_status_prompt():
+        """Display current mode status before the prompt."""
+        if listen_state.ptt_mode:
+            print("\n[Push-to-talk -> ACTIVATED]")
+        elif listen_state.enabled:
+            print("\n[Continuous Mic -> Active]")
+        else:
+            print("\n[Continuous Mic -> Active by default]")
+
     # Keep reading commands/messages from stdin without blocking the event loop.
     while True:
+        show_status_prompt()
         msg = await asyncio.to_thread(input, "You> ")
         msg = msg.strip()
 
@@ -821,56 +832,60 @@ async def user_input_loop(session, mic: MicStreamer, player: AudioPlayer, listen
             return
 
         if msg.lower() == "/mic":
-            # Toggle continuous listening. When turning on, interrupt any current
-            # ElevenLabs playback via session.interrupt() and AudioPlayer.clear().
-            if listen_state.enabled:
-                listen_state.enabled = False
-                print("[mic] continuous listen OFF")
-                mic.stop(commit=False)
-            else:
-                listen_state.enabled = True
-                print("[mic] continuous listen ON (speak naturally; I’ll stop listening while I’m talking)")
-                # If the agent is speaking, cut it off when the user starts talking (currently disabled somewhere else, so user can't interrupt).
-                await session.interrupt()   # Stop any current AI speech
-                player.clear()
-                mic.start()     # Start capturing user's speech
-            continue
+            # Switch to continuous listening mode
+            if listen_state.enabled and not listen_state.ptt_mode:
+                # Already in continuous mode
+                print("[ERROR] Already in continuous listening mode")
+                print("        Use /ptt to switch to push-to-talk mode")
+                continue
 
-        if msg.lower() == "/ptt":
-            # Toggle push-to-talk mode
+            # Disable PTT mode if active
             if listen_state.ptt_mode:
-                # Turn off PTT mode
                 listen_state.ptt_mode = False
-                listen_state.enabled = False
-                mic.stop(commit=False)
-
                 # Stop the keyboard listener
                 if ptt_state.keyboard_listener:
                     ptt_state.keyboard_listener.stop()
                     ptt_state.keyboard_listener = None
 
-                print("[ptt] Push-to-talk mode OFF")
-                print("      Use /mic for continuous listening, or /ptt to re-enable PTT")
-            else:
-                # Disable continuous mode if it was on
-                if listen_state.enabled:
-                    listen_state.enabled = False
-                    mic.stop(commit=False)
+            # Enable continuous listening
+            listen_state.enabled = True
+            mic.stop(commit=False)  # Stop any current recording first
+            print("[mic] Continuous listening mode ON")
+            print("      Speak naturally; I'll stop listening while I'm talking")
+            # If the agent is speaking, cut it off when the user starts talking
+            await session.interrupt()   # Stop any current AI speech
+            player.clear()
+            mic.start()     # Start capturing user's speech
+            continue
 
-                listen_state.ptt_mode = True
+        if msg.lower() == "/ptt":
+            # Switch to push-to-talk mode
+            if listen_state.ptt_mode:
+                # Already in PTT mode
+                print("[ERROR] Already in push-to-talk mode")
+                print(f"        Hold '{ptt_state.ptt_key}' keys to speak, or use /mic for continuous listening")
+                continue
 
-                # Create and start the keyboard listener
-                if not ptt_state.keyboard_listener:
-                    ptt_state.keyboard_listener = KeyboardListener(
-                        ptt_key=ptt_state.ptt_key,
-                        on_press_callback=ptt_state.on_press_callback,
-                        on_release_callback=ptt_state.on_release_callback
-                    )
-                ptt_state.keyboard_listener.start()
+            # Disable continuous mode if it was on
+            if listen_state.enabled:
+                listen_state.enabled = False
+                mic.stop(commit=False)
 
-                print(f"[ptt] Push-to-talk mode ON")
-                print(f"      Hold '{ptt_state.ptt_key}' keys to speak")
-                print(f"      Release keys to send your message")
+            # Enable PTT mode
+            listen_state.ptt_mode = True
+
+            # Create and start the keyboard listener
+            if not ptt_state.keyboard_listener:
+                ptt_state.keyboard_listener = KeyboardListener(
+                    ptt_key=ptt_state.ptt_key,
+                    on_press_callback=ptt_state.on_press_callback,
+                    on_release_callback=ptt_state.on_release_callback
+                )
+            ptt_state.keyboard_listener.start()
+
+            print(f"[ptt] Push-to-talk mode ON")
+            print(f"      Hold '{ptt_state.ptt_key}' keys to speak")
+            print(f"      Release keys to send your message")
             continue
 
         if msg.lower() == "/stop":
@@ -1236,6 +1251,11 @@ async def main():
                 )
                 keyboard_listener.start()
                 print(f"[ptt] Push-to-talk enabled (hold '{ptt_key}' keys to speak)")
+            else:
+                # If PTT is not enabled, start continuous listening by default
+                listen_state.enabled = True
+                mic.start()
+                print("[mic] Continuous listening mode active by default (speak naturally)")
 
             # Create PTTState to pass to user_input_loop
             ptt_state = PTTState(
