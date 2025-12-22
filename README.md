@@ -438,6 +438,18 @@ Halfred's personality is defined in `main.py:807-830`. Key traits:
 
 ## Troubleshooting
 
+### ScreenMonitorMCP directory is empty
+If the ScreenMonitorMCP directory exists but is empty, you need to initialize git submodules:
+```bash
+git submodule update --init --recursive
+```
+This is a common issue if you cloned without the `--recursive` flag. After running this command, proceed with the installation:
+```bash
+cd ScreenMonitorMCP
+pip install -e .
+cd ..
+```
+
 ### No audio output
 - Check system audio output settings
 - Verify ElevenLabs API key is valid
