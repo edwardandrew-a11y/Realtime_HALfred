@@ -725,6 +725,7 @@ async def mic_send_loop(session, mic: MicStreamer):
     When `None` is received, we send silence frames with commit=True to
     force the server to finalize the user turn.
     """
+    audio_chunks_sent = 0
     while True:
         chunk = await mic.queue.get()
         if chunk is None:
@@ -732,8 +733,11 @@ async def mic_send_loop(session, mic: MicStreamer):
             # to help semantic VAD detect the end of speech
             silence_duration_samples = 12000  # 0.5 seconds at 24kHz
             silence_bytes = b"\x00" * (silence_duration_samples * 2)  # 2 bytes per int16 sample
+            print(f"[mic_send] Committing turn ({audio_chunks_sent} chunks sent, {len(silence_bytes)} silence bytes)")
             await session.send_audio(silence_bytes, commit=True)
+            audio_chunks_sent = 0  # Reset counter for next turn
             continue
+        audio_chunks_sent += 1
         await session.send_audio(chunk)
 
 
@@ -784,8 +788,8 @@ def create_ptt_handlers(
         listen_state.ptt_active = False
         print("[ptt] << Keys released - processing your speech...\n")
 
-        # Stop the microphone and commit the audio (send it for processing)
-        # With turn detection disabled, the commit signal triggers response generation
+        # Stop the microphone and commit the audio with trailing silence
+        # The semantic VAD will detect the silence and automatically trigger a response
         mic.stop(commit=True)
 
     return on_ptt_press, on_ptt_release
@@ -807,16 +811,21 @@ async def user_input_loop(session, mic: MicStreamer, player: AudioPlayer, listen
     dev_cmds = ""
     if os.getenv("DEV_MODE", "false").lower() == "true":
         dev_cmds = ", /screeninfo, /screenshot [full|active], /highlight x y w h, /confirm_test, /demo_click"
-    print(f"\nType messages. Commands: /mic (continuous listen), /ptt (push-to-talk), /stop (interrupt speech), /mcp (list tools), /quit{dev_cmds}\n")
+
+    # Display mode info (locked at startup - no switching allowed)
+    mode_info = "Push-to-talk mode" if listen_state.ptt_mode else "Continuous listening mode"
+    print(f"\n{mode_info} (configured via PTT_ENABLED in .env)")
+    print(f"Commands: /stop (interrupt speech), /mcp (list tools), /quit{dev_cmds}\n")
 
     def show_status_prompt():
         """Display current mode status before the prompt."""
         if listen_state.ptt_mode:
-            print("\n[Push-to-talk -> ACTIVATED]")
-        elif listen_state.enabled:
-            print("\n[Continuous Mic -> Active]")
+            if listen_state.ptt_active:
+                print("\n[PTT: RECORDING]")
+            else:
+                print(f"\n[PTT: Hold {ptt_state.ptt_key} to speak]")
         else:
-            print("\n[Continuous Mic -> Active by default]")
+            print("\n[Continuous: Active]")
 
     # Keep reading commands/messages from stdin without blocking the event loop.
     while True:
@@ -830,63 +839,6 @@ async def user_input_loop(session, mic: MicStreamer, player: AudioPlayer, listen
             mic.stop(commit=False)
             await session.close()
             return
-
-        if msg.lower() == "/mic":
-            # Switch to continuous listening mode
-            if listen_state.enabled and not listen_state.ptt_mode:
-                # Already in continuous mode
-                print("[ERROR] Already in continuous listening mode")
-                print("        Use /ptt to switch to push-to-talk mode")
-                continue
-
-            # Disable PTT mode if active
-            if listen_state.ptt_mode:
-                listen_state.ptt_mode = False
-                # Stop the keyboard listener
-                if ptt_state.keyboard_listener:
-                    ptt_state.keyboard_listener.stop()
-                    ptt_state.keyboard_listener = None
-
-            # Enable continuous listening
-            listen_state.enabled = True
-            mic.stop(commit=False)  # Stop any current recording first
-            print("[mic] Continuous listening mode ON")
-            print("      Speak naturally; I'll stop listening while I'm talking")
-            # If the agent is speaking, cut it off when the user starts talking
-            await session.interrupt()   # Stop any current AI speech
-            player.clear()
-            mic.start()     # Start capturing user's speech
-            continue
-
-        if msg.lower() == "/ptt":
-            # Switch to push-to-talk mode
-            if listen_state.ptt_mode:
-                # Already in PTT mode
-                print("[ERROR] Already in push-to-talk mode")
-                print(f"        Hold '{ptt_state.ptt_key}' keys to speak, or use /mic for continuous listening")
-                continue
-
-            # Disable continuous mode if it was on
-            if listen_state.enabled:
-                listen_state.enabled = False
-                mic.stop(commit=False)
-
-            # Enable PTT mode
-            listen_state.ptt_mode = True
-
-            # Create and start the keyboard listener
-            if not ptt_state.keyboard_listener:
-                ptt_state.keyboard_listener = KeyboardListener(
-                    ptt_key=ptt_state.ptt_key,
-                    on_press_callback=ptt_state.on_press_callback,
-                    on_release_callback=ptt_state.on_release_callback
-                )
-            ptt_state.keyboard_listener.start()
-
-            print(f"[ptt] Push-to-talk mode ON")
-            print(f"      Hold '{ptt_state.ptt_key}' keys to speak")
-            print(f"      Release keys to send your message")
-            continue
 
         if msg.lower() == "/stop":
             # Interrupt HALfred's current speech
@@ -1173,9 +1125,21 @@ async def main():
             # the assistant's text to ElevenLabs for speech.
             # The quickstart shows model_name 'gpt-realtime' and typical audio/transcription/turn detection settings.  [oai_citation:6‡OpenAI GitHub Pages](https://openai.github.io/openai-agents-python/realtime/quickstart/)
 
-            # Turn detection: Always enabled for both PTT and continuous modes
-            # In PTT mode, we manually control when audio is sent, but VAD still detects end of speech
-            # In continuous mode, VAD detects both start and end of speech automatically
+            # Turn detection: Enabled for both PTT and continuous modes
+            # PTT mode: VAD detects silence after commit to trigger response
+            #           PTT gates the mic - VAD only runs while keys are held
+            # Continuous mode: VAD auto-detects speech boundaries and triggers responses
+            turn_detection_config = {
+                "type": "semantic_vad",
+                "eagerness": "medium",
+                "create_response": True,
+                "interrupt_response": True,
+            }
+            if ptt_enabled:
+                print("[config] Voice Activity Detection: ENABLED (PTT-gated mic)")
+            else:
+                print("[config] Voice Activity Detection: ENABLED (continuous mode)")
+
             runner = RealtimeRunner(
                 starting_agent=agent,
                 config={  # type: ignore[arg-type]
@@ -1187,13 +1151,8 @@ async def main():
                         "input_audio_noise_reduction": {
                             "type": "near_field"  # or "far_field" or null to disable
                         },
-                        # Turn detection enabled for both PTT and continuous modes
-                        "turn_detection": {
-                            "type": "semantic_vad",
-                            "eagerness": "medium",
-                            "create_response": True,
-                            "interrupt_response": True,
-                        },
+                        # Turn detection: None for PTT, semantic_vad for continuous
+                        "turn_detection": turn_detection_config,
                         # Optional: get transcripts of the user's audio for debugging.
                         "input_audio_transcription": {"model": "whisper-1"},
 
