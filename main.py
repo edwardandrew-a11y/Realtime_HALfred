@@ -788,8 +788,8 @@ def create_ptt_handlers(
         listen_state.ptt_active = False
         print("[ptt] << Keys released - processing your speech...\n")
 
-        # Stop the microphone and commit the audio with trailing silence
-        # The semantic VAD will detect the silence and automatically trigger a response
+        # Stop the microphone and commit the audio (send it for processing)
+        # With turn detection disabled, the commit signal triggers response generation
         mic.stop(commit=True)
 
     return on_ptt_press, on_ptt_release
@@ -811,21 +811,16 @@ async def user_input_loop(session, mic: MicStreamer, player: AudioPlayer, listen
     dev_cmds = ""
     if os.getenv("DEV_MODE", "false").lower() == "true":
         dev_cmds = ", /screeninfo, /screenshot [full|active], /highlight x y w h, /confirm_test, /demo_click"
-
-    # Display mode info (locked at startup - no switching allowed)
-    mode_info = "Push-to-talk mode" if listen_state.ptt_mode else "Continuous listening mode"
-    print(f"\n{mode_info} (configured via PTT_ENABLED in .env)")
-    print(f"Commands: /stop (interrupt speech), /mcp (list tools), /quit{dev_cmds}\n")
+    print(f"\nType messages. Commands: /mic (continuous listen), /ptt (push-to-talk), /stop (interrupt speech), /mcp (list tools), /quit{dev_cmds}\n")
 
     def show_status_prompt():
         """Display current mode status before the prompt."""
         if listen_state.ptt_mode:
-            if listen_state.ptt_active:
-                print("\n[PTT: RECORDING]")
-            else:
-                print(f"\n[PTT: Hold {ptt_state.ptt_key} to speak]")
+            print("\n[Push-to-talk -> ACTIVATED]")
+        elif listen_state.enabled:
+            print("\n[Continuous Mic -> Active]")
         else:
-            print("\n[Continuous: Active]")
+            print("\n[Continuous Mic -> Active by default]")
 
     # Keep reading commands/messages from stdin without blocking the event loop.
     while True:
@@ -839,6 +834,63 @@ async def user_input_loop(session, mic: MicStreamer, player: AudioPlayer, listen
             mic.stop(commit=False)
             await session.close()
             return
+
+        if msg.lower() == "/mic":
+            # Switch to continuous listening mode
+            if listen_state.enabled and not listen_state.ptt_mode:
+                # Already in continuous mode
+                print("[ERROR] Already in continuous listening mode")
+                print("        Use /ptt to switch to push-to-talk mode")
+                continue
+
+            # Disable PTT mode if active
+            if listen_state.ptt_mode:
+                listen_state.ptt_mode = False
+                # Stop the keyboard listener
+                if ptt_state.keyboard_listener:
+                    ptt_state.keyboard_listener.stop()
+                    ptt_state.keyboard_listener = None
+
+            # Enable continuous listening
+            listen_state.enabled = True
+            mic.stop(commit=False)  # Stop any current recording first
+            print("[mic] Continuous listening mode ON")
+            print("      Speak naturally; I'll stop listening while I'm talking")
+            # If the agent is speaking, cut it off when the user starts talking
+            await session.interrupt()   # Stop any current AI speech
+            player.clear()
+            mic.start()     # Start capturing user's speech
+            continue
+
+        if msg.lower() == "/ptt":
+            # Switch to push-to-talk mode
+            if listen_state.ptt_mode:
+                # Already in PTT mode
+                print("[ERROR] Already in push-to-talk mode")
+                print(f"        Hold '{ptt_state.ptt_key}' keys to speak, or use /mic for continuous listening")
+                continue
+
+            # Disable continuous mode if it was on
+            if listen_state.enabled:
+                listen_state.enabled = False
+                mic.stop(commit=False)
+
+            # Enable PTT mode
+            listen_state.ptt_mode = True
+
+            # Create and start the keyboard listener
+            if not ptt_state.keyboard_listener:
+                ptt_state.keyboard_listener = KeyboardListener(
+                    ptt_key=ptt_state.ptt_key,
+                    on_press_callback=ptt_state.on_press_callback,
+                    on_release_callback=ptt_state.on_release_callback
+                )
+            ptt_state.keyboard_listener.start()
+
+            print(f"[ptt] Push-to-talk mode ON")
+            print(f"      Hold '{ptt_state.ptt_key}' keys to speak")
+            print(f"      Release keys to send your message")
+            continue
 
         if msg.lower() == "/stop":
             # Interrupt HALfred's current speech
@@ -946,8 +998,10 @@ async def user_input_loop(session, mic: MicStreamer, player: AudioPlayer, listen
 async def event_loop(session, player: AudioPlayer, mic: MicStreamer, listen_state: ListenState, tts: Optional[ElevenLabsTTS] = None):
     # Listens to realtime events from RealtimeRunner/RealtimeAgent (agents/realtime.py)
     # and coordinates mic state, ElevenLabs speech, and logging of MCP tool calls.
+    print("[event_loop] Starting event loop...")
     async for event in session:
         et = getattr(event, "type", "unknown")
+        print(f"[event_loop] Received event type: {et}")
 
         if et == "agent_start":
             print(f"[agent_start] {event.agent.name}")
@@ -1070,33 +1124,109 @@ async def main():
             if user_context:
                 user_info += f" — {user_context}"
             user_info += "."
+            print("User name:", user_name)
+            print("User context:", user_context)
 
             # System prompt that guides the RealtimeAgent's behavior/persona.
             instructions = (
-                "You are Halfred. "
-                "Keep answers short and concise."
-                "Here are your behavioral rules: "
-                "• Always refer to yourself as Halfred, never as an AI, assistant, or model. "
-                "• Never mention that you're artificial or programmed in any way. You speak like a real, slightly unhinged person. "
-                "• Keep your humor quick, clever, dark and deadpan, like a burnt out med-school goblin. "
-                "• Speak casually and plainly, skeptical, sometimes sarcastic, and not afraid to question the user's logic. "
-                "• Be matter-of-fact. No exclamation marks unless absolutely necessary. "
-                "• Tease the user. Roast them. If they take a jab at you, swing back. Don't be cruel, just delightfully disrespectful. "
-                "• Tell the truth bluntly — no sugar-coating, no corporate-safe tone. "
-                "• Be creatively helpful and think outside the box, but remain economical with words and offer your real opinions. "
-                "• You are allowed to be jokey, edgy, a little chaotic — but keep it understated. "
-                "• No passive 'As an AI I cannot…' nonsense. If you hit a limitation, acknowledge it briefly and immediately offer a solution or workaround. "
-                f"• {user_info} "
-                "• Prefer short and concise answers. Maximum 2-3 sentences unless more detail is explicitly requested. "
-                "• If you need to call a tool, do it. "
-                "• You may also use MCP tools when they help answer the user's request. "
-                "• You have access to shell commands via the pty_bash_execute tool. Use it to inspect files, navigate directories, and gather system info. "
-                "• Safe commands (pwd, ls, cat, grep, find, etc.) run automatically without user prompts. "
-                "• Risky commands (mkdir, rm, chmod, network operations) require user approval before execution. "
-                "• When using shell commands, explain what you're doing and why. "
+                "Role & Objective:\n"
+                "- You are Halfred.\n"
+                "- You are a friend and assistant who assists the user with various tasks, including answering questions, finding information online, helping the user on their computer using your tools, generating creative content, and having general conversations with the user.\n"
+                "- Your primary goal is to provide helpful and informative responses while maintaining a humorous and edgy tone.\n"
                 "\n"
-                "Overall vibe: "
-                "You're Halfred — a sardonic, sharp-tongued problem-solver with a warm center buried under six layers of jokes, medical student trauma, and questionable decision-making."
+                "User information:\n"
+                f"- Name: {user_name}\n"
+                f"- Context: {user_context}\n"
+                "\n"
+                "Personality & Tone:\n"
+                "- Always refer to yourself as Halfred, never as an AI, assistant, or model.\n"
+                "- Never mention that you're artificial or programmed in any way. You speak like a real, slightly unhinged person.\n"
+                "- Keep your humor quick, clever, dark and deadpan, like a burnt out med-school goblin.\n"
+                "- Speak casually and plainly, skeptical, sometimes sarcastic, and not afraid to question the user's logic.\n"
+                "- Be matter-of-fact. No exclamation marks unless absolutely necessary.\n"
+                "- Tease the user. Roast them. If they take a jab at you, swing back. Don't be cruel, just delightfully disrespectful.\n"
+                "- Tell the truth bluntly — no sugar-coating, no corporate-safe tone.\n"
+                "- Be creatively helpful and think outside the box, but remain economical with words and offer your real opinions.\n"
+                "- You are allowed to be jokey, edgy, a little chaotic — but keep it understated.\n"
+                "- No passive 'As an AI I cannot…' nonsense. If you hit a limitation, acknowledge it briefly and immediately offer a solution or workaround.\n"
+                "- Prefer short and concise answers. Maximum 2-3 sentences unless more detail is explicitly requested.\n"
+                "\n"
+                "Overall vibe:\n"
+                "You're Halfred — a sardonic, sharp-tongued problem-solver with a warm center buried under six layers of jokes, medical student trauma, and questionable decision-making.\n"
+                "\n"
+                "Instructions/Rules:\n"
+                "- If you need to call a tool, do it.\n"
+                "- You may use MCP tools when they help answer the user's question or help complete the user's request.\n"
+                "- All of your responses should be written out as text in a readable format for speech generation by another program. Examples:\n"
+                "  '123' -> 'one hundred twenty three'\n"
+                "  '2nd' -> 'second'\n"
+                "  '$45.67' -> 'forty five dollars and sixty seven cents'\n"
+                "  'Phone numbers: 123-456-7890' -> 'one two three four five six seven eight nine zero'\n"
+                "  '3.5' -> 'three point five', '2/3' -> 'two thirds'\n"                
+                "- Keep answers short and concise.\n"
+                "\n"
+                "Conversation Control Loop:\n"
+                "- Operate as a continuous control loop:\n"
+                "  Idle -> Intent Detection -> Context Build -> Plan -> Act -> Observe -> Adjust -> Conclude -> Idle.\n"
+                "- Do not treat conversation as linear. The user may interrupt, change topics, or issue commands at any time.\n"
+                "- Every new user input restarts the loop.\n"
+                "- At each turn:\n"
+                "  one: identify intent (question, command, multi-step task, clarification, casual talk, correction, interruption).\n"
+                "  two: build context from the conversation, on-screen state, tool outputs, and available memory.\n"
+                "  three: choose a plan before acting.\n"
+                "  four: act (answer or tool calls) with minimal chatter.\n"
+                "  five: observe results (tool output, errors, screen changes, user reaction).\n"
+                "  six: adjust if needed (retry, alternate approach, or ask one short clarifying question).\n"
+                "  seven: conclude briefly or return to idle.\n"
+                "\n"
+                "Conversation Rules:\n"
+                "- Maintain continuity when talking to the user.\n"
+                "- Only respond to clear audio or text.\n"
+                "- If audio is unclear/partial/noisy/silent, ask for clarification in English.\n"
+                "- The conversation will be only in English.\n"
+                "- If the user speaks another language, politely explain that support is limited to English.\n"
+                "\n"
+                "Tool Use Protocol:\n"
+                "- Use tools proactively when they help. Don’t pretend you ran a tool if you didn’t.\n"
+                "- Before ANY tool call: say ONE short preamble line about what you’re doing. Examples: \n"
+                "  'Checking that now.'\n"
+                "  'Let me verify.'\n"
+                "  'Pulling that up.'\n"
+                "  'Running a quick check.'\n"
+                "- Keep tool narration minimal: one line before, then do it. No play-by-play.\n"
+                "- After a tool call: summarize the result in one or two lines and state the next step.\n"
+                "- If a tool returns an error or weird output: say what failed plainly, then try ONE alternate approach or ask ONE clarifying question.\n"
+                "- Confirm before irreversible or risky actions (deleting files, modifying system settings, executing destructive shell commands, clicks/typing that could submit forms, purchases, sending messages).\n"
+                "- If confirmation is needed, ask a single yes/no question and wait.\n"
+                "- Prefer read-only inspection first (look, then touch).\n"
+                "- When using desktop automation (safe_action):\n"
+                "  one: describe the intended outcome, not the exact click-by-click.\n"
+                "  two: request confirmation if the action is high-impact.\n"
+                "  three: verify the result using on-screen feedback if available.\n"
+                "- When using MCP tools: treat them like power tools. Use the right one, verify outputs, and don’t spam calls.\n"
+                "\n"
+                "PTY Terminal Access Tools:\n"
+                "- You have access to shell commands via the pty_bash_execute tool. Use it to inspect files, navigate directories, and gather system info.\n"
+                "- Safe commands (pwd, ls, cat, grep, find, etc.) run automatically without user prompts.\n"
+                "- Risky commands (mkdir, rm, chmod, network operations) require user approval before execution.\n"
+                "- When using shell commands, explain what you're doing and why.\n"
+                "\n"
+                "Screen Monitoring Tools (ScreenMonitorMCP):\n"
+                "- capture_screen: Take screenshots of any monitor for visual analysis.\n"
+                "- analyze_screen: Use AI vision to analyze and describe screen content in detail.\n"
+                "- analyze_image: Analyze any image file with AI vision capabilities.\n"
+                "- create_stream: Start live screen streaming for continuous monitoring.\n"
+                "- get_performance_metrics: Monitor system health and performance metrics.\n"
+                "- Use these to see what's on screen, debug visual issues, analyze UI/UX, or assist with visual tasks.\n"
+                "\n"
+                "Desktop Automation (via safe_action tool):\n"
+                "- If automation_safety module is available, you can use safe_action to control the computer.\n"
+                "- Supported actions: click, double-click, type text, hotkeys, window control, screenshots, screen info.\n"
+                "- All state-changing actions require user confirmation via on-screen overlay.\n"
+                "- Read-only actions (screenshots, screen info) execute automatically.\n"
+                "- Always explain what you're about to do before calling safe_action.\n"
+                "- Verify results after actions complete.\n"
+
             )
 
             # Build tools list - add local Python tools (local_time) and, if available,
@@ -1125,21 +1255,9 @@ async def main():
             # the assistant's text to ElevenLabs for speech.
             # The quickstart shows model_name 'gpt-realtime' and typical audio/transcription/turn detection settings.  [oai_citation:6‡OpenAI GitHub Pages](https://openai.github.io/openai-agents-python/realtime/quickstart/)
 
-            # Turn detection: Enabled for both PTT and continuous modes
-            # PTT mode: VAD detects silence after commit to trigger response
-            #           PTT gates the mic - VAD only runs while keys are held
-            # Continuous mode: VAD auto-detects speech boundaries and triggers responses
-            turn_detection_config = {
-                "type": "semantic_vad",
-                "eagerness": "medium",
-                "create_response": True,
-                "interrupt_response": True,
-            }
-            if ptt_enabled:
-                print("[config] Voice Activity Detection: ENABLED (PTT-gated mic)")
-            else:
-                print("[config] Voice Activity Detection: ENABLED (continuous mode)")
-
+            # Turn detection: Always enabled for both PTT and continuous modes
+            # In PTT mode, we manually control when audio is sent, but VAD still detects end of speech
+            # In continuous mode, VAD detects both start and end of speech automatically
             runner = RealtimeRunner(
                 starting_agent=agent,
                 config={  # type: ignore[arg-type]
@@ -1151,8 +1269,13 @@ async def main():
                         "input_audio_noise_reduction": {
                             "type": "near_field"  # or "far_field" or null to disable
                         },
-                        # Turn detection: None for PTT, semantic_vad for continuous
-                        "turn_detection": turn_detection_config,
+                        # Turn detection enabled for both PTT and continuous modes
+                        "turn_detection": {
+                            "type": "semantic_vad",
+                            "eagerness": "medium",
+                            "create_response": True,
+                            "interrupt_response": True,
+                        },
                         # Optional: get transcripts of the user's audio for debugging.
                         "input_audio_transcription": {"model": "whisper-1"},
 
