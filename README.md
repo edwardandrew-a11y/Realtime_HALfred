@@ -2,6 +2,8 @@
 
 A Python-based realtime voice assistant powered by OpenAI's Realtime API and ElevenLabs TTS. HALfred is a sardonic, sharp-tongued AI companion with personality, capable of natural voice conversations and equipped with screen monitoring capabilities through MCP integration.
 
+> **Recent Updates:** Tool schemas have been improved with proper type enforcement, enum constraints, and conditional validation. See [TOOLS.md](TOOLS.md) for complete documentation.
+
 ## Overview
 
 Realtime HALfred uses:
@@ -127,10 +129,39 @@ Halfred will:
 - Click only if you approve
 
 **Implementation:**
-- **Automation Backend:** automation-mcp (20 tools - mouseClick, type, screenshot, window control, etc.)
-- **Confirmation UI:** feedback-loop-mcp (native macOS overlay)
-- **Safety Wrapper:** automation_safety.py (orchestrates both)
-- **Fallback:** PyAutoGUI (if automation-mcp unavailable)
+
+`automation_safety.py` is a Python module that provides the `safe_action` tool to the agent. This tool wraps raw automation capabilities with a mandatory safety confirmation flow, preventing the agent from executing desktop automation commands without user approval.
+
+**What automation_safety.py does:**
+- Provides a single `safe_action` tool that replaces 20+ raw automation-mcp tools
+- Enforces human-in-the-loop confirmation for all state-changing actions
+- Orchestrates the 4-step safety flow automatically (screenshot → highlight → confirm → execute)
+- Routes tool calls to the appropriate backend (automation-mcp or PyAutoGUI fallback)
+- Cannot be bypassed by the agent (enforced at the code level)
+
+**Architecture:**
+```
+Agent calls: safe_action(action_type="click", x=100, y=200, description="Click Safari")
+     ↓
+automation_safety.py:
+  1. Takes screenshot via automation-mcp
+  2. Highlights target via automation-mcp
+  3. Requests confirmation via feedback-loop-mcp
+  4. If approved → Executes mouseClick via automation-mcp
+     If denied → Returns "Action cancelled by user"
+```
+
+**Why use a wrapper instead of raw MCP tools?**
+- **Safety by default:** Agent cannot call mouseClick/type/hotkey directly
+- **Simpler for agent:** One tool instead of coordinating 4 separate tools
+- **Consistent pattern:** Matches pty_proxy_mcp design (risky commands require approval)
+- **Reduces errors:** Less cognitive load for the agent means fewer mistakes
+
+**Components:**
+- **automation-mcp:** 20 raw tools (mouseClick, type, screenshot, window control, etc.) - NOT directly exposed to agent
+- **feedback-loop-mcp:** Native macOS overlay for confirmation UI
+- **automation_safety.py:** Safety wrapper that exposes only the `safe_action` tool
+- **PyAutoGUI:** Fallback implementation when automation-mcp is unavailable (Windows/Linux)
 
 **⚠️ Known Issues:**
 - automation-mcp requires a FastMCP compatibility patch (see docs/FASTMCP_PATCH.md)

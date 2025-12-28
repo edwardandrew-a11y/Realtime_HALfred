@@ -14,7 +14,7 @@ import asyncio
 import os
 import platform
 from dataclasses import dataclass, field
-from typing import Optional, Any, Dict, List
+from typing import Optional, Any, Dict, List, Literal
 from agents import function_tool
 
 # Platform detection
@@ -315,7 +315,7 @@ async def request_confirmation(
 
 @function_tool
 async def safe_action(
-    action_type: str,
+    action_type: Literal["click", "double_click", "type", "hotkey", "window_control"],
     description: str,
     x: Optional[int] = None,
     y: Optional[int] = None,
@@ -472,6 +472,72 @@ Action: {action_type}
 
     except Exception as e:
         return f"❌ Action failed: {description}\nError: {str(e)}"
+
+
+# Fix safe_action schema: only action_type + description required, with conditional requirements
+safe_action.params_json_schema["required"] = ["action_type", "description"]
+
+# Add conditional validation using JSON Schema if/then
+# Important: Also constrain types in 'then' to prevent null values for required fields
+safe_action.params_json_schema["allOf"] = [
+    # Click and double_click require x, y (and they must be integers, not null)
+    {
+        "if": {
+            "properties": {
+                "action_type": {"enum": ["click", "double_click"]}
+            }
+        },
+        "then": {
+            "required": ["x", "y"],
+            "properties": {
+                "x": {"type": "integer"},
+                "y": {"type": "integer"}
+            }
+        }
+    },
+    # Type requires text (and it must be a string, not null)
+    {
+        "if": {
+            "properties": {
+                "action_type": {"const": "type"}
+            }
+        },
+        "then": {
+            "required": ["text"],
+            "properties": {
+                "text": {"type": "string", "minLength": 1}
+            }
+        }
+    },
+    # Hotkey requires hotkey (and it must be a string, not null)
+    {
+        "if": {
+            "properties": {
+                "action_type": {"const": "hotkey"}
+            }
+        },
+        "then": {
+            "required": ["hotkey"],
+            "properties": {
+                "hotkey": {"type": "string", "minLength": 1}
+            }
+        }
+    },
+    # Window_control requires window_title (and it must be a string, not null)
+    {
+        "if": {
+            "properties": {
+                "action_type": {"const": "window_control"}
+            }
+        },
+        "then": {
+            "required": ["window_title"],
+            "properties": {
+                "window_title": {"type": "string", "minLength": 1}
+            }
+        }
+    }
+]
 
 
 # DEV_MODE helper functions
