@@ -9,6 +9,7 @@
 import asyncio
 import json
 import os
+import sys
 import threading
 import time
 from contextlib import AsyncExitStack
@@ -52,6 +53,76 @@ except ImportError as e:
 # Import MCP schema fix to patch tool schemas for OpenAI Realtime API compatibility
 # This fixes tools like keyboard_type that use union schemas without top-level "type": "object"
 import mcp_schema_fix  # Applies monkey-patch on import
+
+
+# Thread-safe printing that respects the input prompt
+_input_active = threading.Event()
+_print_lock = threading.Lock()
+_current_line_buffer = []
+_chars_printed = 0  # Track how many characters we've already printed
+_last_prompt_restore = 0.0
+_streaming_started = False  # Track if we've moved off the prompt line
+
+
+def safe_print(*args, **kwargs):
+    """Print that clears and restores the 'You> ' prompt when input is active."""
+    global _last_prompt_restore, _chars_printed, _streaming_started
+    import time
+
+    with _print_lock:
+        if _input_active.is_set():
+            # For streaming text (end="" or end without newline), buffer it
+            end = kwargs.get('end', '\n')
+
+            if end == '' or (end and '\n' not in end):
+                # Buffering mode for streaming text (character-by-character from assistant)
+                _current_line_buffer.append(' '.join(str(arg) for arg in args))
+                full_text = ''.join(_current_line_buffer)
+
+                # Only update display every 50ms or when buffer is substantial
+                now = time.time()
+                new_chars = len(full_text) - _chars_printed
+                if (now - _last_prompt_restore) < 0.05 and new_chars < 40:
+                    return  # Skip this update, too soon
+                _last_prompt_restore = now
+
+                # On first streaming character, move to a new line
+                if not _streaming_started:
+                    print()  # Move off the "You> " line
+                    _streaming_started = True
+
+                # Print only the NEW characters since last print (incremental update)
+                if new_chars > 0:
+                    new_text = full_text[_chars_printed:]
+                    print(new_text, end='', flush=True)
+                    _chars_printed = len(full_text)
+            else:
+                # Normal print with newline
+                # First, complete any buffered streaming text
+                if _current_line_buffer:
+                    full_text = ''.join(_current_line_buffer)
+                    # Print any remaining unprinted characters
+                    if _chars_printed < len(full_text):
+                        remaining = full_text[_chars_printed:]
+                        print(remaining, end='')
+                    _current_line_buffer.clear()
+                    _chars_printed = 0
+                    _streaming_started = False
+                    # Print buffered text and move to new line
+                    print()  # newline to complete the streaming text line
+
+                # Now print the new message on a fresh line (clearing any prompt)
+                print('\r\033[K', end='')
+                print(*args, **kwargs, end=end)
+
+                # Restore the prompt on a new line
+                print("You> ", end='', flush=True)
+        else:
+            # Not waiting for input, just print normally and clear buffer
+            _current_line_buffer.clear()
+            _chars_printed = 0
+            _streaming_started = False
+            print(*args, **kwargs)
 
 
 # Shortens any long strings received from other parts of the program before printing them (useful when logging raw MCP/events).
@@ -415,7 +486,9 @@ class ElevenLabsTTS:
             return
 
         try:
-            print(f"[elevenlabs] Speaking: \"{text[:50]}...\"")
+            # Commented out verbose speaking notifications to reduce terminal clutter
+            # Uncomment for debugging if needed
+            # safe_print(f"[elevenlabs] Speaking: \"{text[:50]}...\"")
             self.is_speaking = True
 
             # Use streaming API for low latency
@@ -437,7 +510,7 @@ class ElevenLabsTTS:
                         self.player.write(chunk)
 
         except Exception as e:
-            print(f"[elevenlabs] TTS error: {e}")
+            safe_print(f"[elevenlabs] TTS error: {e}")
             import traceback
             traceback.print_exc()
         finally:
@@ -483,7 +556,7 @@ class ElevenLabsTTS:
         self.player.clear()
 
         self.is_speaking = False
-        print("[elevenlabs] Speech interrupted")
+        safe_print("[elevenlabs] Speech interrupted")
 
 
 # Captures microphone audio and feeds it into the realtime session through an asyncio queue.
@@ -737,7 +810,7 @@ async def mic_send_loop(session, mic: MicStreamer):
             # to help semantic VAD detect the end of speech
             silence_duration_samples = 12000  # 0.5 seconds at 24kHz
             silence_bytes = b"\x00" * (silence_duration_samples * 2)  # 2 bytes per int16 sample
-            print(f"[mic_send] Committing turn ({audio_chunks_sent} chunks sent, {len(silence_bytes)} silence bytes)")
+            safe_print(f"[mic_send] Committing turn ({audio_chunks_sent} chunks sent, {len(silence_bytes)} silence bytes)")
             await session.send_audio(silence_bytes, commit=True)
             audio_chunks_sent = 0  # Reset counter for next turn
             continue
@@ -764,7 +837,7 @@ def create_ptt_handlers(
             return  # PTT mode not enabled
 
         listen_state.ptt_active = True
-        print("\n[ptt] >> RECORDING (keys held) - speak now...")
+        safe_print("\n[ptt] >> RECORDING (keys held) - speak now...")
 
         # If configured, interrupt any current speech (only if actually speaking)
         if listen_state.ptt_interrupts:
@@ -774,7 +847,7 @@ def create_ptt_handlers(
             if is_speaking:
                 if tts is not None:
                     tts.interrupt()
-                print("[ptt] << Speech interrupted")
+                safe_print("[ptt] << Speech interrupted")
 
                 # Also tell OpenAI to stop its current response
                 loop.call_soon_threadsafe(
@@ -790,7 +863,7 @@ def create_ptt_handlers(
             return  # PTT mode not enabled
 
         listen_state.ptt_active = False
-        print("[ptt] << Keys released - processing your speech...\n")
+        safe_print("[ptt] << Keys released - processing your speech...\n")
 
         # Stop the microphone and commit the audio (send it for processing)
         # With turn detection disabled, the commit signal triggers response generation
@@ -829,8 +902,17 @@ async def user_input_loop(session, mic: MicStreamer, player: AudioPlayer, listen
     # Keep reading commands/messages from stdin without blocking the event loop.
     while True:
         show_status_prompt()
-        msg = await asyncio.to_thread(input, "You> ")
-        msg = msg.strip()
+        # Print the prompt ourselves so we can manage it properly
+        print("You> ", end='', flush=True)
+        # Signal that we're waiting for input
+        _input_active.set()
+        try:
+            # Use empty string since we already printed the prompt
+            msg = await asyncio.to_thread(input, "")
+            msg = msg.strip()
+        finally:
+            # Clear the flag after input is received
+            _input_active.clear()
 
         if msg.lower() in {"/quit", "/exit"}:
             # Gracefully shut down the session and microphone.
@@ -1002,38 +1084,39 @@ async def user_input_loop(session, mic: MicStreamer, player: AudioPlayer, listen
 async def event_loop(session, player: AudioPlayer, mic: MicStreamer, listen_state: ListenState, tts: Optional[ElevenLabsTTS] = None):
     # Listens to realtime events from RealtimeRunner/RealtimeAgent (agents/realtime.py)
     # and coordinates mic state, ElevenLabs speech, and logging of MCP tool calls.
-    print("[event_loop] Starting event loop...")
+    safe_print("[event_loop] Starting event loop...")
     async for event in session:
         et = getattr(event, "type", "unknown")
-        print(f"[event_loop] Received event type: {et}")
 
         if et == "agent_start":
-            print(f"[agent_start] {event.agent.name}")
+            safe_print(f"[agent_start] {event.agent.name}")
             if mic.running:
                 # The server VAD already decided the user turn ended and started the response.
                 # Stop mic capture now so background noise doesn't create extra user turns.
                 mic.stop(commit=False)
 
         elif et == "agent_end":
-            print(f"[agent_end] {event.agent.name}")
+            safe_print(f"[agent_end] {event.agent.name}")
             # Flush any remaining text in the ElevenLabs buffer and wait for playback to complete
             if tts:
                 await tts.flush()   # Wait for Elevenlabs to finish speaking
 
             # Restart microphone after ElevenLabs finishes speaking; if continuous mode is ON
             if listen_state.enabled and not mic.running:
-                print("[mic] Restarting microphone after response")
+                safe_print("[mic] Restarting microphone after response")
                 mic.start()
 
         elif et == "tool_start":
-            print(f"[tool_start] {event.tool.name} args={_truncate(event.arguments)}")
+            safe_print(f"[tool_start] {event.tool.name} args={_truncate(event.arguments)}")
 
         elif et == "tool_end":
-            print(f"[tool_end] {event.tool.name} output={_truncate(str(event.output))}")
+            safe_print(f"[tool_end] {event.tool.name} output={_truncate(str(event.output))}")
 
         elif et == "history_added":
             # The session maintains conversation history; this fires often.
-            print(f"[history_added] item={_truncate(str(event.item))}")
+            # Commented out to reduce log spam - uncomment for debugging
+            # safe_print(f"[history_added] item={_truncate(str(event.item))}")
+            pass
 
         elif et == "history_updated":
             # Full history snapshot; usually spammy.
@@ -1047,7 +1130,7 @@ async def event_loop(session, player: AudioPlayer, mic: MicStreamer, listen_stat
         elif et == "audio_end":
             # This code is only used if the RealtimeAPI modality is audio, and Elevenlabs is disabled
             # Agent finished speaking
-            print("[audio_end]")
+            safe_print("[audio_end]")
             if listen_state.enabled:
                 mic.start()
 
@@ -1057,10 +1140,10 @@ async def event_loop(session, player: AudioPlayer, mic: MicStreamer, listen_stat
             # if this is triggered.
             # Kind of problematic if user interrupting is enabled as the AI's own speech can trigger it.
             player.clear()
-            print("[audio_interrupted]")
+            safe_print("[audio_interrupted]")
 
         elif et == "error":
-            print(f"[error] {event.error}")
+            safe_print(f"[error] {event.error}")
 
         elif et == "raw_model_event":
             # In realtime, raw_model_event wraps a server event with a dict payload
@@ -1070,26 +1153,26 @@ async def event_loop(session, player: AudioPlayer, mic: MicStreamer, listen_stat
                 # Stream assistant text as it arrives and send to ElevenLabs
                 if t == "response.output_text.delta":
                     delta = raw_evt.get("delta", "")
-                    print(delta, end="", flush=True)
+                    safe_print(delta, end="", flush=True)
                     # Send text to ElevenLabs for TTS
                     if tts and delta:
                         tts.add_text(delta)
                 elif t == "response.output_text.done":
-                    print("", flush=True)  # newline
+                    safe_print("", flush=True)  # newline
                     # Flush remaining text to ElevenLabs
                     if tts:
                         await tts.flush()
 
                 # Keep errors visible
                 elif t == "error":
-                    print(f"\n[raw_error] {raw_evt}\n")
+                    safe_print(f"\n[raw_error] {raw_evt}\n")
 
                 # Otherwise: ignore most raw spam (session.updated, rate_limits, etc.)
                 else:
                     pass
         else:
             # If something new appears, we'll see it.
-            print(f"[{et}] {_truncate(str(event))}")
+            safe_print(f"[{et}] {_truncate(str(event))}")
 
 
 async def main():
