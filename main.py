@@ -63,10 +63,14 @@ _chars_printed = 0  # Track how many characters we've already printed
 _last_prompt_restore = 0.0
 _streaming_started = False  # Track if we've moved off the prompt line
 
+# Transcription retroactive printing state
+_transcription_placeholder_line = None  # Line number where we printed the placeholder
+_lines_printed_since_placeholder = 0    # How many lines printed since placeholder
+
 
 def safe_print(*args, **kwargs):
     """Print that clears and restores the 'You> ' prompt when input is active."""
-    global _last_prompt_restore, _chars_printed, _streaming_started
+    global _last_prompt_restore, _chars_printed, _streaming_started, _lines_printed_since_placeholder
     import time
 
     with _print_lock:
@@ -90,6 +94,7 @@ def safe_print(*args, **kwargs):
                 if not _streaming_started:
                     print()  # Move off the "You> " line
                     _streaming_started = True
+                    _lines_printed_since_placeholder += 1
 
                 # Print only the NEW characters since last print (incremental update)
                 if new_chars > 0:
@@ -97,32 +102,74 @@ def safe_print(*args, **kwargs):
                     print(new_text, end='', flush=True)
                     _chars_printed = len(full_text)
             else:
-                # Normal print with newline
+                # Normal print with newline - this interrupts streaming
                 # First, complete any buffered streaming text
                 if _current_line_buffer:
                     full_text = ''.join(_current_line_buffer)
                     # Print any remaining unprinted characters
                     if _chars_printed < len(full_text):
                         remaining = full_text[_chars_printed:]
-                        print(remaining, end='')
+                        print(remaining, end='', flush=True)
+                    # Move to new line to complete the streaming text
+                    print()
                     _current_line_buffer.clear()
                     _chars_printed = 0
                     _streaming_started = False
-                    # Print buffered text and move to new line
-                    print()  # newline to complete the streaming text line
+                    _lines_printed_since_placeholder += 1
 
                 # Now print the new message on a fresh line (clearing any prompt)
                 print('\r\033[K', end='')
                 print(*args, **kwargs, end=end)
+                _lines_printed_since_placeholder += 1
 
                 # Restore the prompt on a new line
                 print("You> ", end='', flush=True)
+
+                # Reset rate limiting timestamp so next streaming text doesn't get throttled
+                _last_prompt_restore = time.time()
         else:
             # Not waiting for input, just print normally and clear buffer
             _current_line_buffer.clear()
             _chars_printed = 0
             _streaming_started = False
             print(*args, **kwargs)
+            _lines_printed_since_placeholder += 1
+
+
+def retroactive_print_transcription(transcript: str):
+    """Retroactively update the transcription placeholder line with the actual transcript."""
+    global _transcription_placeholder_line, _lines_printed_since_placeholder, _print_lock
+
+    with _print_lock:
+        if _transcription_placeholder_line is None:
+            # No placeholder to update, just print normally (shouldn't happen)
+            return
+
+        lines_to_move = _lines_printed_since_placeholder
+
+        # If transcription arrives before any other output, just overwrite directly
+        if lines_to_move == 0:
+            # We're still on the same line or right after, just clear and rewrite
+            print('\r\033[K', end='', flush=True)
+            print(f"[transcription] \"{transcript}\"", flush=True)
+        else:
+            # Save current cursor position, move up, overwrite, restore position
+            # Move cursor up to the placeholder line
+            print(f"\033[{lines_to_move}A", end='', flush=True)  # Move up
+
+            # Move to beginning of line and clear it
+            print('\r\033[K', end='', flush=True)  # Go to start, clear line
+
+            # Print the transcription (WITHOUT newline to stay on same line)
+            print(f"[transcription] \"{transcript}\"", end='', flush=True)
+
+            # Move cursor back down to original position (same number of lines we moved up)
+            # Then move to a new line to continue from where we left off
+            print(f"\033[{lines_to_move}E", end='', flush=True)  # Move down and to column 0
+
+        # Reset placeholder tracking
+        _transcription_placeholder_line = None
+        _lines_printed_since_placeholder = 0
 
 
 # Shortens any long strings received from other parts of the program before printing them (useful when logging raw MCP/events).
@@ -351,6 +398,9 @@ class ListenState:
     ptt_mode: bool = False          # True if using push-to-talk instead of continuous
     ptt_active: bool = False        # True while the PTT key is being held
     ptt_interrupts: bool = True     # Whether PTT should stop HALfred's speech
+    speech_ended_event: Optional[asyncio.Event] = None  # Signals when server VAD detects speech end
+    turn_state: str = "idle"        # Track commit state: "idle", "awaiting_speech_end", "committed"
+    bytes_appended_since_commit: int = 0  # Track how much audio we've sent since last commit
 
 
 @dataclass
@@ -794,27 +844,85 @@ class KeyboardListener:
             self._listener = None
 
 
-async def mic_send_loop(session, mic: MicStreamer):
+async def mic_send_loop(session, mic: MicStreamer, listen_state: ListenState):
     # Bridge between MicStreamer and the RealtimeAgent session (agents/realtime.py):
     # forwards mic audio chunks to the session so the model can transcribe them.
     """Continuously send mic audio to the realtime session.
 
-    When `None` is received, we send silence frames with commit=True to
-    force the server to finalize the user turn.
+    When `None` is received in PTT mode, we stream silence and wait for the server's
+    speech_ended event before committing, ensuring VAD has time to process.
     """
-    audio_chunks_sent = 0
+    MIN_AUDIO_BYTES = 4800  # 100ms at 24kHz = minimum required by OpenAI
+
     while True:
         chunk = await mic.queue.get()
         if chunk is None:
-            # Send a longer silence period (0.5 seconds at 24kHz, mono, 16-bit = 24000 samples = 48000 bytes)
-            # to help semantic VAD detect the end of speech
-            silence_duration_samples = 12000  # 0.5 seconds at 24kHz
-            silence_bytes = b"\x00" * (silence_duration_samples * 2)  # 2 bytes per int16 sample
-            safe_print(f"[mic_send] Committing turn ({audio_chunks_sent} chunks sent, {len(silence_bytes)} silence bytes)")
-            await session.send_audio(silence_bytes, commit=True)
-            audio_chunks_sent = 0  # Reset counter for next turn
+            # Guard against double-commits and empty buffer commits
+            if listen_state.turn_state == "committed":
+                safe_print(f"[mic_send] Ignoring commit request (already committed this turn)")
+                continue
+
+            if listen_state.bytes_appended_since_commit < MIN_AUDIO_BYTES:
+                safe_print(f"[mic_send] Skipping commit (only {listen_state.bytes_appended_since_commit} bytes, need {MIN_AUDIO_BYTES})")
+                listen_state.turn_state = "idle"
+                listen_state.bytes_appended_since_commit = 0
+                continue
+
+            # PTT mode: Wait for server VAD to detect speech end and auto-commit
+            if listen_state.ptt_mode:
+                # Transition to awaiting_speech_end state
+                listen_state.turn_state = "awaiting_speech_end"
+                safe_print(f"[mic_send] Sending silence, waiting for VAD speech_ended... ({listen_state.bytes_appended_since_commit} bytes)")
+
+                # Stream silence frames while waiting for server to detect speech end and auto-commit
+                # (The server auto-commits when speech_ended fires because create_response: True)
+                silence_chunk_size = 4800  # 0.1s of silence per chunk (4800 bytes = 2400 samples at 24kHz)
+                max_wait_time = 1.5  # Maximum 1.5 seconds to wait for speech_ended
+                start_time = asyncio.get_event_loop().time()
+
+                # Clear the event before waiting
+                if listen_state.speech_ended_event:
+                    listen_state.speech_ended_event.clear()
+
+                while listen_state.turn_state == "awaiting_speech_end":
+                    # Send a chunk of silence to help VAD detect speech end
+                    await session.send_audio(b"\x00" * silence_chunk_size, commit=False)
+                    listen_state.bytes_appended_since_commit += silence_chunk_size
+
+                    # Wait for speech_ended event with a short timeout
+                    try:
+                        if listen_state.speech_ended_event:
+                            await asyncio.wait_for(listen_state.speech_ended_event.wait(), timeout=0.1)
+                            # Speech ended detected - server will auto-commit
+                            # Wait a moment for the audio_committed event to arrive and update turn_state
+                            await asyncio.sleep(0.05)
+                            if listen_state.turn_state == "committed":
+                                safe_print(f"[mic_send] Server auto-committed, turn complete")
+                                break
+                    except asyncio.TimeoutError:
+                        pass  # Continue sending silence
+
+                    # Safety fallback: don't wait forever
+                    elapsed = asyncio.get_event_loop().time() - start_time
+                    if elapsed > max_wait_time:
+                        safe_print(f"[mic_send] Timeout waiting for speech_ended ({elapsed:.1f}s), server will auto-commit")
+                        # Mark as committed so we don't try again
+                        listen_state.turn_state = "committed"
+                        listen_state.bytes_appended_since_commit = 0
+                        break
+            else:
+                # Continuous mode: commit immediately with silence padding
+                listen_state.turn_state = "committed"
+                silence_duration_samples = 12000  # 0.5 seconds at 24kHz
+                silence_bytes = b"\x00" * (silence_duration_samples * 2)  # 2 bytes per int16 sample
+                safe_print(f"[mic_send] Committing turn ({listen_state.bytes_appended_since_commit} bytes sent, {len(silence_bytes)} silence bytes)")
+                await session.send_audio(silence_bytes, commit=True)
+                listen_state.bytes_appended_since_commit = 0
+
             continue
-        audio_chunks_sent += 1
+
+        # Regular audio chunk - append it and track bytes
+        listen_state.bytes_appended_since_commit += len(chunk)
         await session.send_audio(chunk)
 
 
@@ -837,6 +945,9 @@ def create_ptt_handlers(
             return  # PTT mode not enabled
 
         listen_state.ptt_active = True
+        # Reset turn state for new recording
+        listen_state.turn_state = "idle"
+        listen_state.bytes_appended_since_commit = 0
         safe_print("\n[ptt] >> RECORDING (keys held) - speak now...")
 
         # If configured, interrupt any current speech (only if actually speaking)
@@ -1101,6 +1212,9 @@ async def event_loop(session, player: AudioPlayer, mic: MicStreamer, listen_stat
             if tts:
                 await tts.flush()   # Wait for Elevenlabs to finish speaking
 
+            # Reset turn state after response completes (ready for next turn)
+            listen_state.turn_state = "idle"
+
             # Restart microphone after ElevenLabs finishes speaking; if continuous mode is ON
             if listen_state.enabled and not mic.running:
                 safe_print("[mic] Restarting microphone after response")
@@ -1163,9 +1277,52 @@ async def event_loop(session, player: AudioPlayer, mic: MicStreamer, listen_stat
                     if tts:
                         await tts.flush()
 
+                # Log transcription events to debug audio processing
+                elif t == "conversation.item.input_audio_transcription.completed":
+                    transcript = raw_evt.get("transcript", "")
+                    # Use retroactive print to update the placeholder
+                    retroactive_print_transcription(transcript)
+                elif t == "conversation.item.input_audio_transcription.failed":
+                    safe_print(f"[transcription_failed] {raw_evt.get('error', 'Unknown error')}")
+
+                # Log critical session events that show turn/response flow
+                elif t == "input_audio_buffer.committed":
+                    global _transcription_placeholder_line, _lines_printed_since_placeholder
+                    safe_print(f"[audio_committed] Audio buffer committed to session")
+                    # Print placeholder for transcription (will be updated when transcription arrives)
+                    safe_print(f"[transcription] ...")
+                    # Mark that we have a placeholder and reset counter AFTER printing
+                    # This way counter tracks lines printed AFTER the placeholder line
+                    _transcription_placeholder_line = True
+                    _lines_printed_since_placeholder = 0
+                    # Mark as committed when server auto-commits (with create_response: True)
+                    if listen_state.turn_state == "awaiting_speech_end":
+                        listen_state.turn_state = "committed"
+                        listen_state.bytes_appended_since_commit = 0
+                elif t == "input_audio_buffer.speech_started":
+                    safe_print(f"[speech_detected] VAD detected speech starting")
+                elif t == "input_audio_buffer.speech_stopped":
+                    safe_print(f"[speech_ended] VAD detected speech ending")
+                    # Signal that speech ended so mic_send_loop knows turn is complete
+                    # (The server will auto-commit because create_response: True)
+                    if listen_state.turn_state == "awaiting_speech_end" and listen_state.speech_ended_event:
+                        listen_state.speech_ended_event.set()
+                elif t == "conversation.item.created":
+                    item_type = raw_evt.get("item", {}).get("type")
+                    safe_print(f"[conversation_item] Created: {item_type}")
+                elif t == "response.created":
+                    safe_print(f"[response_created] OpenAI started creating response")
+                elif t == "response.done":
+                    safe_print(f"[response_done] OpenAI finished response")
+
                 # Keep errors visible
                 elif t == "error":
                     safe_print(f"\n[raw_error] {raw_evt}\n")
+
+                # Log unhandled events for debugging (commented out to reduce spam)
+                # Uncomment this to see ALL events coming from OpenAI
+                # else:
+                #     safe_print(f"[raw_event:{t}] {_truncate(str(raw_evt))}")
 
                 # Otherwise: ignore most raw spam (session.updated, rate_limits, etc.)
                 else:
@@ -1389,7 +1546,7 @@ async def main():
                 samplerate=24000,
                 mute_fn=None,    # set to 'lambda: player.is_playing()' to mute mic during elevenlabs playback
             )
-            listen_state = ListenState()
+            listen_state = ListenState(speech_ended_event=asyncio.Event())
 
             # Load push-to-talk configuration
             ptt_enabled = os.getenv("PTT_ENABLED", "false").lower() == "true"
@@ -1441,7 +1598,7 @@ async def main():
                     # These tasks all share the session/player/mic/tts objects defined above.
                     t1 = asyncio.create_task(user_input_loop(session, mic, player, listen_state, mcp_servers, ptt_state, tts))
                     t2 = asyncio.create_task(event_loop(session, player, mic, listen_state, tts))
-                    t3 = asyncio.create_task(mic_send_loop(session, mic))
+                    t3 = asyncio.create_task(mic_send_loop(session, mic, listen_state))
                     done, pending = await asyncio.wait({t1, t2, t3}, return_when=asyncio.FIRST_COMPLETED)
                     for task in pending:
                         task.cancel()
