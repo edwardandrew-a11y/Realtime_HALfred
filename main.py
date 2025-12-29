@@ -63,14 +63,10 @@ _chars_printed = 0  # Track how many characters we've already printed
 _last_prompt_restore = 0.0
 _streaming_started = False  # Track if we've moved off the prompt line
 
-# Transcription retroactive printing state
-_transcription_placeholder_line = None  # Line number where we printed the placeholder
-_lines_printed_since_placeholder = 0    # How many lines printed since placeholder
-
 
 def safe_print(*args, **kwargs):
     """Print that clears and restores the 'You> ' prompt when input is active."""
-    global _last_prompt_restore, _chars_printed, _streaming_started, _lines_printed_since_placeholder
+    global _last_prompt_restore, _chars_printed, _streaming_started
     import time
 
     with _print_lock:
@@ -94,7 +90,6 @@ def safe_print(*args, **kwargs):
                 if not _streaming_started:
                     print()  # Move off the "You> " line
                     _streaming_started = True
-                    _lines_printed_since_placeholder += 1
 
                 # Print only the NEW characters since last print (incremental update)
                 if new_chars > 0:
@@ -115,12 +110,10 @@ def safe_print(*args, **kwargs):
                     _current_line_buffer.clear()
                     _chars_printed = 0
                     _streaming_started = False
-                    _lines_printed_since_placeholder += 1
 
                 # Now print the new message on a fresh line (clearing any prompt)
                 print('\r\033[K', end='')
                 print(*args, **kwargs, end=end)
-                _lines_printed_since_placeholder += 1
 
                 # Restore the prompt on a new line
                 print("You> ", end='', flush=True)
@@ -133,43 +126,6 @@ def safe_print(*args, **kwargs):
             _chars_printed = 0
             _streaming_started = False
             print(*args, **kwargs)
-            _lines_printed_since_placeholder += 1
-
-
-def retroactive_print_transcription(transcript: str):
-    """Retroactively update the transcription placeholder line with the actual transcript."""
-    global _transcription_placeholder_line, _lines_printed_since_placeholder, _print_lock
-
-    with _print_lock:
-        if _transcription_placeholder_line is None:
-            # No placeholder to update, just print normally (shouldn't happen)
-            return
-
-        lines_to_move = _lines_printed_since_placeholder
-
-        # If transcription arrives before any other output, just overwrite directly
-        if lines_to_move == 0:
-            # We're still on the same line or right after, just clear and rewrite
-            print('\r\033[K', end='', flush=True)
-            print(f"[transcription] \"{transcript}\"", flush=True)
-        else:
-            # Save current cursor position, move up, overwrite, restore position
-            # Move cursor up to the placeholder line
-            print(f"\033[{lines_to_move}A", end='', flush=True)  # Move up
-
-            # Move to beginning of line and clear it
-            print('\r\033[K', end='', flush=True)  # Go to start, clear line
-
-            # Print the transcription (WITHOUT newline to stay on same line)
-            print(f"[transcription] \"{transcript}\"", end='', flush=True)
-
-            # Move cursor back down to original position (same number of lines we moved up)
-            # Then move to a new line to continue from where we left off
-            print(f"\033[{lines_to_move}E", end='', flush=True)  # Move down and to column 0
-
-        # Reset placeholder tracking
-        _transcription_placeholder_line = None
-        _lines_printed_since_placeholder = 0
 
 
 # Shortens any long strings received from other parts of the program before printing them (useful when logging raw MCP/events).
@@ -1280,21 +1236,13 @@ async def event_loop(session, player: AudioPlayer, mic: MicStreamer, listen_stat
                 # Log transcription events to debug audio processing
                 elif t == "conversation.item.input_audio_transcription.completed":
                     transcript = raw_evt.get("transcript", "")
-                    # Use retroactive print to update the placeholder
-                    retroactive_print_transcription(transcript)
+                    safe_print(f"[transcription] \"{transcript}\"")
                 elif t == "conversation.item.input_audio_transcription.failed":
                     safe_print(f"[transcription_failed] {raw_evt.get('error', 'Unknown error')}")
 
                 # Log critical session events that show turn/response flow
                 elif t == "input_audio_buffer.committed":
-                    global _transcription_placeholder_line, _lines_printed_since_placeholder
                     safe_print(f"[audio_committed] Audio buffer committed to session")
-                    # Print placeholder for transcription (will be updated when transcription arrives)
-                    safe_print(f"[transcription] ...")
-                    # Mark that we have a placeholder and reset counter AFTER printing
-                    # This way counter tracks lines printed AFTER the placeholder line
-                    _transcription_placeholder_line = True
-                    _lines_printed_since_placeholder = 0
                     # Mark as committed when server auto-commits (with create_response: True)
                     if listen_state.turn_state == "awaiting_speech_end":
                         listen_state.turn_state = "committed"
