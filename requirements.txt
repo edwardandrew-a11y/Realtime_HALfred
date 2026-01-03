@@ -26,14 +26,24 @@ openai-agents>=0.6.0
 mcp>=1.0.0
 
 # ========================================
-# Optional Dependencies
+# Desktop Automation Dependencies (Computer-Control-MCP)
 # ========================================
 
-# PyAutoGUI - Optional fallback for desktop automation on Windows/Linux
-# Only needed if ENABLE_AUTOMATION_MCP=true and automation-mcp is unavailable
+# UV - Required to run computer-control-mcp via uvx
+# Computer-Control-MCP is installed and run via: uvx computer-control-mcp@latest
+# This installs PyAutoGUI, RapidOCR, ONNXRuntime automatically
+uv>=0.1.0
+
+# PyAutoGUI - Optional direct fallback for desktop automation
+# Only needed if ENABLE_COMPUTER_CONTROL_MCP=false and you want direct PyAutoGUI access
 # Install with: pip install pyautogui
-# Note: automation-mcp (via npm/bun) is preferred for macOS
 # pyautogui>=0.9.54
+
+# Pillow - Optional for screenshot support on Windows/Linux
+# macOS uses native screencapture command (no dependencies)
+# Windows/Linux require Pillow for screenshot functionality
+# Install with: pip install Pillow
+# Pillow>=10.0.0
 
 # ========================================
 # Submodule Dependencies

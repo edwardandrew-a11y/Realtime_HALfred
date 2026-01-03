@@ -5,9 +5,9 @@ This module provides a composite safe_action() tool that orchestrates:
 1. Screenshot capture
 2. Target highlighting
 3. User confirmation via feedback-loop-mcp
-4. Action execution via automation-mcp
+4. Action execution via computer-control-mcp
 
-Cross-platform support with macOS primary, Windows/Linux fallback to PyAutoGUI.
+Cross-platform support with computer-control-mcp (PyAutoGUI-based) for all platforms.
 """
 
 import asyncio
@@ -71,7 +71,7 @@ async def call_mcp_tool(
     Call an MCP tool by server name and tool name.
 
     Args:
-        server_name: Name of the MCP server (e.g., "automation", "feedback-loop")
+        server_name: Name of the MCP server (e.g., "computer-control", "feedback-loop")
         tool_name: Name of the tool to call
         args: Arguments dictionary for the tool
         mcp_servers: List of initialized MCP server objects
@@ -98,9 +98,9 @@ async def call_mcp_tool(
 
 async def init_display_detection(mcp_servers: List[Any]) -> Optional[DisplayInfo]:
     """
-    Initialize display detection by querying automation-mcp for screen info.
+    Initialize display detection by querying computer-control-mcp for screen info.
 
-    This should be called once on startup if ENABLE_AUTOMATION_MCP=true.
+    This should be called once on startup if ENABLE_COMPUTER_CONTROL_MCP=true.
 
     Args:
         mcp_servers: List of initialized MCP server objects
@@ -112,10 +112,10 @@ async def init_display_detection(mcp_servers: List[Any]) -> Optional[DisplayInfo
 
     _mcp_servers_cache = mcp_servers
 
-    # Check if automation MCP is available
-    automation_server = await find_mcp_server("automation", mcp_servers)
+    # Check if computer-control MCP is available
+    automation_server = await find_mcp_server("computer-control", mcp_servers)
     if not automation_server:
-        print("[automation_safety] automation-mcp not available, using PyAutoGUI fallback")
+        print("[automation_safety] computer-control-mcp not available, using PyAutoGUI fallback")
         # Create display info using PyAutoGUI
         try:
             import pyautogui
@@ -124,7 +124,7 @@ async def init_display_detection(mcp_servers: List[Any]) -> Optional[DisplayInfo
                 screens=[{"x": 0, "y": 0, "width": screen_size.width, "height": screen_size.height}],
                 active_window=None
             )
-            print(f"[automation_safety] Detected screen: {screen_size.width}x{screen_size.height} (PyAutoGUI)")
+            # Silently detected (avoid interrupting user input)
             return _display_info
         except ImportError:
             print("[automation_safety] Warning: PyAutoGUI not available. Using default screen size.")
@@ -135,18 +135,27 @@ async def init_display_detection(mcp_servers: List[Any]) -> Optional[DisplayInfo
             return _display_info
 
     try:
-        # Get screen info
-        screen_result = await call_mcp_tool("automation", "screenInfo", {}, mcp_servers)
+        # Get screen info from computer-control-mcp
+        screen_result = await call_mcp_tool("computer-control", "get_screen_size", {}, mcp_servers)
 
-        # Parse screen info - automation-mcp returns text content
+        # Parse screen info - computer-control-mcp returns text content
         # Format: {"content": [{"type": "text", "text": "..."}]}
         screens = []
         if hasattr(screen_result, 'content') and screen_result.content:
             # Parse the text response
             text = screen_result.content[0].text if screen_result.content else ""
-            # Example: "Screen 0: 0x0 1920x1080"
-            # For now, assume single screen - more sophisticated parsing can be added
-            screens.append({"x": 0, "y": 0, "width": 1920, "height": 1080})
+            # Try to extract width and height from response
+            # Expected format: "width: 1920, height: 1080" or similar
+            import re
+            width_match = re.search(r'width[:\s]+(\d+)', text, re.IGNORECASE)
+            height_match = re.search(r'height[:\s]+(\d+)', text, re.IGNORECASE)
+            if width_match and height_match:
+                width = int(width_match.group(1))
+                height = int(height_match.group(1))
+                screens.append({"x": 0, "y": 0, "width": width, "height": height})
+            else:
+                # Fallback to default screen size
+                screens.append({"x": 0, "y": 0, "width": 1920, "height": 1080})
         else:
             # Fallback to default screen size
             screens.append({"x": 0, "y": 0, "width": 1920, "height": 1080})
@@ -154,18 +163,18 @@ async def init_display_detection(mcp_servers: List[Any]) -> Optional[DisplayInfo
         # Get active window
         active_window = None
         try:
-            window_result = await call_mcp_tool("automation", "getActiveWindow", {}, mcp_servers)
+            window_result = await call_mcp_tool("computer-control", "list_windows", {}, mcp_servers)
             if hasattr(window_result, 'content') and window_result.content:
                 active_window = {"info": window_result.content[0].text}
         except Exception as e:
-            print(f"[automation_safety] Could not get active window: {e}")
+            print(f"[automation_safety] Could not get windows list: {e}")
 
         _display_info = DisplayInfo(
             screens=screens,
             active_window=active_window
         )
 
-        print(f"[automation_safety] Display detection complete: {len(screens)} screen(s)")
+        # Silently complete to avoid interrupting user input during background init
         return _display_info
 
     except Exception as e:
@@ -179,7 +188,7 @@ async def init_display_detection(mcp_servers: List[Any]) -> Optional[DisplayInfo
 
 async def take_screenshot(mcp_servers: List[Any], mode: str = "full") -> str:
     """
-    Take a screenshot using automation-mcp or fallback methods.
+    Take a screenshot using computer-control-mcp or fallback methods.
 
     Args:
         mcp_servers: List of MCP servers
@@ -189,24 +198,28 @@ async def take_screenshot(mcp_servers: List[Any], mode: str = "full") -> str:
         Success message or error string
     """
     try:
-        automation_server = await find_mcp_server("automation", mcp_servers)
+        automation_server = await find_mcp_server("computer-control", mcp_servers)
 
         if automation_server:
-            # Use automation-mcp screenshot
-            result = await call_mcp_tool("automation", "screenshot", {"full": mode == "full"}, mcp_servers)
+            # Use computer-control-mcp screenshot (no parameters needed for full screen)
+            result = await call_mcp_tool("computer-control", "take_screenshot", {}, mcp_servers)
             if hasattr(result, 'content') and result.content:
-                return f"Screenshot captured: {result.content[0].text}"
+                # computer-control-mcp returns ImageContent, not TextContent
+                content_item = result.content[0]
+                if hasattr(content_item, 'text'):
+                    return f"Screenshot captured: {content_item.text}"
+                else:
+                    # ImageContent - screenshot was captured successfully
+                    return "Screenshot captured successfully (image data returned)"
             return "Screenshot captured successfully"
         else:
-            # Fallback: Try pyautogui or similar
-            if not IS_MACOS:
-                try:
-                    import pyautogui
-                    screenshot = pyautogui.screenshot()
-                    return f"Screenshot captured ({screenshot.width}x{screenshot.height})"
-                except ImportError:
-                    return "Screenshot unavailable (install pyautogui for fallback)"
-            return "Screenshot unavailable (automation-mcp not enabled)"
+            # Fallback: Try pyautogui
+            try:
+                import pyautogui
+                screenshot = pyautogui.screenshot()
+                return f"Screenshot captured ({screenshot.width}x{screenshot.height})"
+            except ImportError:
+                return "Screenshot unavailable (install pyautogui for fallback)"
 
     except Exception as e:
         return f"Screenshot failed: {e}"
@@ -214,7 +227,7 @@ async def take_screenshot(mcp_servers: List[Any], mode: str = "full") -> str:
 
 async def highlight_region(mcp_servers: List[Any], x: int, y: int, w: int, h: int, duration: int = 2) -> None:
     """
-    Highlight a screen region using automation-mcp.
+    Highlight a screen region (computer-control-mcp doesn't support this, so this is a no-op).
 
     Args:
         mcp_servers: List of MCP servers
@@ -222,21 +235,9 @@ async def highlight_region(mcp_servers: List[Any], x: int, y: int, w: int, h: in
         w, h: Width and height
         duration: Highlight duration in seconds
     """
-    try:
-        automation_server = await find_mcp_server("automation", mcp_servers)
-
-        if automation_server:
-            await call_mcp_tool(
-                "automation",
-                "screenHighlight",
-                {"x": x, "y": y, "width": w, "height": h, "duration": duration},
-                mcp_servers
-            )
-        else:
-            print(f"[automation_safety] Highlight unavailable: automation-mcp not enabled")
-
-    except Exception as e:
-        print(f"[automation_safety] Highlight failed (non-critical): {e}")
+    # computer-control-mcp doesn't have a highlight feature
+    # This is a non-critical feature, so we'll just log and skip it
+    print(f"[automation_safety] Highlight not supported by computer-control-mcp (would highlight {x},{y} {w}x{h})")
 
 
 async def request_confirmation(
@@ -351,14 +352,14 @@ async def safe_action(
     """
     global _mcp_servers_cache
 
-    # Desktop automation: prefer automation-mcp if available, fallback to PyAutoGUI
-    # Check if automation-mcp server is actually loaded
+    # Desktop automation: prefer computer-control-mcp if available, fallback to PyAutoGUI
+    # Check if computer-control-mcp server is actually loaded
     using_mcp = False
     for server in _mcp_servers_cache:
-        if getattr(server, 'name', '') == 'automation':
+        if getattr(server, 'name', '') == 'computer-control':
             using_mcp = True
             break
-    automation_backend = "automation-mcp" if using_mcp else "PyAutoGUI"
+    automation_backend = "computer-control-mcp" if using_mcp else "PyAutoGUI"
 
     # Check if approval is required
     require_approval = os.getenv("AUTOMATION_REQUIRE_APPROVAL", "true").lower() == "true"
@@ -418,29 +419,33 @@ Action: {action_type}
         # Step 4: Execute the action
         print(f"[safe_action] ✓ Executing action: {action_type}...")
 
-        automation_server = await find_mcp_server("automation", mcp_servers)
+        automation_server = await find_mcp_server("computer-control", mcp_servers)
 
         if automation_server:
-            # Use automation-mcp
+            # Use computer-control-mcp
             if action_type.lower() == "click":
-                result = await call_mcp_tool("automation", "mouseClick", {"x": x, "y": y}, mcp_servers)
+                result = await call_mcp_tool("computer-control", "click_screen", {"x": x, "y": y}, mcp_servers)
             elif action_type.lower() == "double_click":
-                result = await call_mcp_tool("automation", "mouseDoubleClick", {"x": x, "y": y}, mcp_servers)
+                # computer-control-mcp doesn't have double-click, so we'll click twice
+                result = await call_mcp_tool("computer-control", "click_screen", {"x": x, "y": y}, mcp_servers)
+                await asyncio.sleep(0.1)  # Small delay between clicks
+                result = await call_mcp_tool("computer-control", "click_screen", {"x": x, "y": y}, mcp_servers)
             elif action_type.lower() == "move":
-                result = await call_mcp_tool("automation", "mouseMove", {"x": x, "y": y}, mcp_servers)
+                result = await call_mcp_tool("computer-control", "move_mouse", {"x": x, "y": y}, mcp_servers)
             elif action_type.lower() == "type":
                 if not text:
                     return "Error: 'text' parameter required for type action"
-                result = await call_mcp_tool("automation", "type", {"text": text}, mcp_servers)
+                result = await call_mcp_tool("computer-control", "type_text", {"text": text}, mcp_servers)
             elif action_type.lower() == "hotkey":
                 if not hotkey:
                     return "Error: 'hotkey' parameter required for hotkey action"
-                # Map to systemCommand for now (automation-mcp may have different hotkey support)
-                result = await call_mcp_tool("automation", "systemCommand", {"command": hotkey}, mcp_servers)
+                # Convert hotkey format (e.g., "cmd+c" to ["cmd", "c"])
+                keys = hotkey.replace("+", ",").replace(" ", "")
+                result = await call_mcp_tool("computer-control", "press_keys", {"keys": keys}, mcp_servers)
             elif action_type.lower() == "window_control":
                 if not window_title:
                     return "Error: 'window_title' parameter required for window_control action"
-                result = await call_mcp_tool("automation", "windowControl", {"title": window_title}, mcp_servers)
+                result = await call_mcp_tool("computer-control", "activate_window", {"title_pattern": window_title}, mcp_servers)
 
             if hasattr(result, 'content') and result.content:
                 result_text = result.content[0].text
@@ -466,9 +471,9 @@ Action: {action_type}
 
                     return f"✅ Action completed (fallback): {description}"
                 except ImportError:
-                    return "Error: automation-mcp not available and pyautogui not installed. Install with: pip install pyautogui"
+                    return "Error: computer-control-mcp not available and pyautogui not installed. Install with: pip install pyautogui"
 
-            return "Error: automation-mcp not available and no fallback available"
+            return "Error: computer-control-mcp not available and no fallback available"
 
     except Exception as e:
         return f"❌ Action failed: {description}\nError: {str(e)}"
@@ -547,6 +552,7 @@ async def get_display_info(mcp_servers: List[Any]) -> str:
     global _display_info
 
     if _display_info is None:
+        print("[automation_safety] Display detection not yet initialized, running now...")
         await init_display_detection(mcp_servers)
 
     if _display_info is None:

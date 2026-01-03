@@ -1,6 +1,6 @@
 # Main entry point for the HALfred voice agent. It wires together audio I/O,
 # the OpenAI Realtime agent stack, ElevenLabs text-to-speech, and optional
-# Model Context Protocol (MCP) automation helpers defined elsewhere in this repo.
+# Model Context Protocol (MCP) computer control helpers defined elsewhere in this repo.
 
 # Claude says to leave the references to MCP_SERVERS_JSON rather than only using MCP_SERVERS.json, as it "future-proofs
 # for Docker/cloud deployments and follows best practices (12-factor app: config via environment)", whatever that means.
@@ -37,10 +37,22 @@ from agents.mcp import (
     create_static_tool_filter,
 )
 # - RealtimeAgent/RealtimeRunner from agents/realtime.py manage the OpenAI realtime conversation session.
-from agents.realtime import RealtimeAgent, RealtimeRunner, RealtimeRunConfig
+from agents.realtime import (
+    RealtimeAgent,
+    RealtimeRunner,
+    RealtimeRunConfig,
+    RealtimeSession,
+)
+from agents.realtime.events import RealtimeToolEnd, RealtimeToolStart
+from agents.realtime.model_inputs import (
+    RealtimeModelSendRawMessage,
+    RealtimeModelSendToolOutput,
+)
+from agents.tool import FunctionTool
+from agents.tool_context import ToolContext
 
 # Import automation safety module (local automation_safety.py) when available to expose
-# the safe_action tool and display detection helpers that talk to automation/feedback MCP servers.
+# the safe_action tool and display detection helpers that talk to computer-control/feedback MCP servers.
 try:
     from automation_safety import safe_action, init_display_detection
     AUTOMATION_SAFETY_AVAILABLE = True
@@ -49,6 +61,15 @@ except ImportError as e:
     AUTOMATION_SAFETY_AVAILABLE = False
     safe_action = None
     init_display_detection = None
+
+# Import native screenshot tool
+try:
+    from native_screenshot import take_screenshot
+    NATIVE_SCREENSHOT_AVAILABLE = True
+except ImportError as e:
+    print(f"[native_screenshot] Module not available: {e}")
+    NATIVE_SCREENSHOT_AVAILABLE = False
+    take_screenshot = None
 
 # Import MCP schema fix to patch tool schemas for OpenAI Realtime API compatibility
 # This fixes tools like keyboard_type that use union schemas without top-level "type": "object"
@@ -253,8 +274,8 @@ async def init_mcp_servers(stack: AsyncExitStack):
         name = entry.get("name") or entry.get("server_label") or "MCP Server"
 
         # Skip servers based on ENABLE_* environment variables
-        if name == "automation" and os.getenv("ENABLE_AUTOMATION_MCP", "false").lower() != "true":
-            print(f"[mcp] Skipping {name} (ENABLE_AUTOMATION_MCP=false)")
+        if name == "computer-control" and os.getenv("ENABLE_COMPUTER_CONTROL_MCP", "false").lower() != "true":
+            print(f"[mcp] Skipping {name} (ENABLE_COMPUTER_CONTROL_MCP=false)")
             continue
         if name == "feedback-loop" and os.getenv("ENABLE_FEEDBACK_LOOP_MCP", "false").lower() != "true":
             print(f"[mcp] Skipping {name} (ENABLE_FEEDBACK_LOOP_MCP=false)")
@@ -357,6 +378,7 @@ class ListenState:
     speech_ended_event: Optional[asyncio.Event] = None  # Signals when server VAD detects speech end
     turn_state: str = "idle"        # Track commit state: "idle", "awaiting_speech_end", "committed"
     bytes_appended_since_commit: int = 0  # Track how much audio we've sent since last commit
+    last_server_event_time: float = 0.0  # Timestamp of last event from server (for connection health)
 
 
 @dataclass
@@ -1092,7 +1114,7 @@ async def user_input_loop(session, mic: MicStreamer, player: AudioPlayer, listen
                 continue
 
             if msg.lower().startswith("/screenshot"):
-                # Uses automation_safety.take_screenshot() to capture the screen through automation-mcp.
+                # Uses automation_safety.take_screenshot() to capture the screen through computer-control-mcp.
                 if AUTOMATION_SAFETY_AVAILABLE:
                     from automation_safety import take_screenshot
                     parts = msg.split()
@@ -1104,7 +1126,7 @@ async def user_input_loop(session, mic: MicStreamer, player: AudioPlayer, listen
                 continue
 
             if msg.lower().startswith("/highlight"):
-                # Calls automation_safety.test_highlight() to draw a highlight box via automation-mcp.
+                # Calls automation_safety.test_highlight() to draw a highlight box via computer-control-mcp.
                 if AUTOMATION_SAFETY_AVAILABLE:
                     from automation_safety import test_highlight
                     parts = msg.split()
@@ -1131,7 +1153,7 @@ async def user_input_loop(session, mic: MicStreamer, player: AudioPlayer, listen
                 continue
 
             if msg.lower() == "/demo_click":
-                # Runs a demo click action via automation_safety.demo_safe_click() (automation MCP).
+                # Runs a demo click action via automation_safety.demo_safe_click() (computer-control MCP).
                 if AUTOMATION_SAFETY_AVAILABLE:
                     from automation_safety import demo_safe_click
                     result = await demo_safe_click(mcp_servers)
@@ -1145,7 +1167,217 @@ async def user_input_loop(session, mic: MicStreamer, player: AudioPlayer, listen
 
         # Text input still works for debugging.
         # Send plain text directly to the realtime session (agents/realtime.py) without audio.
+        safe_print(f"[realtime_client] conversation.item.create (type: message, content: text)")
         await session.send_message(msg)
+
+
+async def connection_health_monitor(listen_state: ListenState):
+    """Monitor connection health and alert if server stops responding."""
+    # Allow 10 minutes of idle time before warning (conservative)
+    IDLE_WARNING_THRESHOLD = 600  # 10 minutes
+    IDLE_ERROR_THRESHOLD = 900    # 15 minutes
+
+    warned = False
+
+    while True:
+        await asyncio.sleep(60)  # Check every minute
+
+        if listen_state.last_server_event_time == 0.0:
+            # Not initialized yet
+            continue
+
+        idle_time = time.monotonic() - listen_state.last_server_event_time
+
+        if idle_time > IDLE_ERROR_THRESHOLD and not warned:
+            safe_print(f"\n⚠️  [connection] WARNING: No server events for {idle_time/60:.1f} minutes")
+            safe_print("[connection] The connection may be stale. Try speaking or type /quit and restart.")
+            warned = True
+        elif idle_time > IDLE_WARNING_THRESHOLD and not warned:
+            safe_print(f"\n[connection] Long idle period detected ({idle_time/60:.1f} minutes)")
+            warned = True
+        elif idle_time < IDLE_WARNING_THRESHOLD:
+            # Reset warning flag if connection becomes active again
+            warned = False
+
+
+async def keepalive_loop(session, mic: MicStreamer, listen_state: ListenState):
+    """Send periodic keepalive signals to prevent connection timeout."""
+    # Send a small keepalive signal every 5 minutes
+    KEEPALIVE_INTERVAL = 300  # 5 minutes
+
+    while True:
+        await asyncio.sleep(KEEPALIVE_INTERVAL)
+
+        try:
+            # Only send keepalive if system is truly idle (not recording, not processing a turn)
+            is_idle = (
+                not mic.running  # Mic not actively recording
+                and listen_state.turn_state == "idle"  # Not in middle of a turn
+                and not listen_state.ptt_active  # PTT key not held
+            )
+
+            if is_idle:
+                # Send a tiny bit of silence as a keepalive (48 bytes = 1ms at 24kHz)
+                # This is enough to keep the WebSocket alive without triggering VAD
+                silence = b"\x00" * 48
+                await session.send_audio(silence, commit=False)
+                safe_print("[keepalive] Sent keepalive signal")
+            else:
+                # Skip keepalive - system is active, so connection is already being kept alive
+                pass
+        except Exception as e:
+            safe_print(f"[keepalive] Failed to send keepalive: {e}")
+
+
+async def handle_screenshot_image(session, tool_output: str):
+    """
+    Handle screenshot tool output by reading the binary image file and sending it to Realtime
+    as a proper image input message (separate from tool output).
+
+    The tool returns only metadata (path, dimensions). This handler reads the actual image
+    file and sends it as an image input to the Realtime session.
+
+    Args:
+        session: RealtimeSession instance
+        tool_output: JSON string from take_screenshot tool containing path and metadata
+    """
+    try:
+        import base64
+        from pathlib import Path
+        from agents.realtime.model_inputs import RealtimeModelSendUserInput
+
+        # Parse the tool output JSON (contains only metadata, not image data)
+        result = json.loads(tool_output)
+
+        if not result.get("success"):
+            safe_print(f"[screenshot_image] Screenshot failed: {result.get('error', 'Unknown error')}")
+            return
+
+        # Get the screenshot file path from metadata
+        screenshot_path = Path(result.get("path"))
+        if not screenshot_path.exists():
+            safe_print(f"[screenshot_image] Screenshot file not found: {screenshot_path}")
+            return
+
+        # Read the image file as binary
+        with open(screenshot_path, "rb") as f:
+            image_bytes = f.read()
+
+        # Create data URL for the image (required by WebSocket JSON protocol)
+        # Note: While this uses base64, it's NOT in the tool output - it's sent as a
+        # separate image input message to the Realtime session
+        safe_print(f"[screenshot] Phase 2 starting: Encoding image to base64 ({len(image_bytes)} bytes)")
+        image_base64 = base64.b64encode(image_bytes).decode('utf-8')
+        image_data_url = f"data:image/png;base64,{image_base64}"
+
+        # Create properly typed user input message with image content
+        # This follows the RealtimeModelUserInputMessage TypedDict structure
+        user_message = {
+            "type": "message",
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_image",
+                    "image_url": image_data_url
+                }
+            ]
+        }
+
+        # Send via session.send_message() which handles the proper event wrapping
+        safe_print(f"[screenshot] Phase 2 complete: Sending image as input_image event (base64: {len(image_base64)} chars)")
+        safe_print(f"[realtime_client] conversation.item.create (type: message, content: input_image)")
+        await session.send_message(user_message)
+        safe_print(f"[screenshot] ✓ Image successfully sent to Realtime API")
+
+    except json.JSONDecodeError as e:
+        safe_print(f"[screenshot_image] Failed to parse tool output: {e}")
+    except Exception as e:
+        import traceback
+        safe_print(f"[screenshot_image] Failed to send image: {e}")
+        safe_print(traceback.format_exc())
+
+
+# Custom handler to batch screenshot metadata + image before triggering a response
+_original_handle_tool_call = RealtimeSession._handle_tool_call
+
+
+async def _handle_tool_call_with_screenshot(self, event, *, agent_snapshot=None):
+    if event.name != "take_screenshot":
+        return await _original_handle_tool_call(self, event, agent_snapshot=agent_snapshot)
+
+    agent = agent_snapshot or self._current_agent
+
+    tools, _handoffs = await asyncio.gather(
+        agent.get_all_tools(self._context_wrapper),
+        self._get_handoffs(agent, self._context_wrapper),
+    )
+    function_map = {tool.name: tool for tool in tools if isinstance(tool, FunctionTool)}
+
+    # Fall back to the original handler if the tool unexpectedly isn't present
+    if event.name not in function_map:
+        return await _original_handle_tool_call(self, event, agent_snapshot=agent_snapshot)
+
+    func_tool = function_map[event.name]
+
+    await self._put_event(
+        RealtimeToolStart(
+            info=self._event_info,
+            tool=func_tool,
+            agent=agent,
+            arguments=event.arguments,
+        )
+    )
+
+    tool_context = ToolContext(
+        context=self._context_wrapper.context,
+        usage=self._context_wrapper.usage,
+        tool_name=event.name,
+        tool_call_id=event.call_id,
+        tool_arguments=event.arguments,
+    )
+    result = await func_tool.on_invoke_tool(tool_context, event.arguments)
+    result_str = str(result)
+
+    success = False
+    try:
+        parsed = json.loads(result_str)
+        success = bool(parsed.get("success"))
+    except Exception:
+        parsed = None
+
+    # On success, delay response creation until the image message is sent.
+    # On failure, keep the default behavior so the model can respond immediately.
+    await self._model.send_event(
+        RealtimeModelSendToolOutput(
+            tool_call=event,
+            output=result_str,
+            start_response=not success,
+        )
+    )
+
+    await self._put_event(
+        RealtimeToolEnd(
+            info=self._event_info,
+            tool=func_tool,
+            output=result,
+            agent=agent,
+            arguments=event.arguments,
+        )
+    )
+
+    if not success:
+        return
+
+    try:
+        await handle_screenshot_image(self, result_str)
+    except Exception as e:
+        safe_print(f"[screenshot] Failed to send image; starting response anyway: {e}")
+        await self._model.send_event(
+            RealtimeModelSendRawMessage(message={"type": "response.create"})
+        )
+
+
+RealtimeSession._handle_tool_call = _handle_tool_call_with_screenshot  # type: ignore[attr-defined]
 
 
 async def event_loop(session, player: AudioPlayer, mic: MicStreamer, listen_state: ListenState, tts: Optional[ElevenLabsTTS] = None):
@@ -1153,6 +1385,8 @@ async def event_loop(session, player: AudioPlayer, mic: MicStreamer, listen_stat
     # and coordinates mic state, ElevenLabs speech, and logging of MCP tool calls.
     safe_print("[event_loop] Starting event loop...")
     async for event in session:
+        # Update last event timestamp for connection health monitoring
+        listen_state.last_server_event_time = time.monotonic()
         et = getattr(event, "type", "unknown")
 
         if et == "agent_start":
@@ -1181,6 +1415,11 @@ async def event_loop(session, player: AudioPlayer, mic: MicStreamer, listen_stat
 
         elif et == "tool_end":
             safe_print(f"[tool_end] {event.tool.name} output={_truncate(str(event.output))}")
+
+            if event.tool.name == "take_screenshot":
+                # Screenshot flow is now handled in the custom tool handler to batch
+                # metadata + image before creating a response.
+                safe_print("[screenshot] Tool end received (batched flow handled upstream)")
 
         elif et == "history_added":
             # The session maintains conversation history; this fires often.
@@ -1220,6 +1459,7 @@ async def event_loop(session, player: AudioPlayer, mic: MicStreamer, listen_stat
             raw_evt = getattr(event.data, "data", None)  # RealtimeModelRawServerEvent.data
             if isinstance(raw_evt, dict):
                 t = raw_evt.get("type")
+
                 # Stream assistant text as it arrives and send to ElevenLabs
                 if t == "response.output_text.delta":
                     delta = raw_evt.get("delta", "")
@@ -1228,7 +1468,8 @@ async def event_loop(session, player: AudioPlayer, mic: MicStreamer, listen_stat
                     if tts and delta:
                         tts.add_text(delta)
                 elif t == "response.output_text.done":
-                    safe_print("", flush=True)  # newline
+                    safe_print("")  # newline
+                    safe_print(f"[realtime_event] response.output_text.done")
                     # Flush remaining text to ElevenLabs
                     if tts:
                         await tts.flush()
@@ -1255,25 +1496,44 @@ async def event_loop(session, player: AudioPlayer, mic: MicStreamer, listen_stat
                     # (The server will auto-commit because create_response: True)
                     if listen_state.turn_state == "awaiting_speech_end" and listen_state.speech_ended_event:
                         listen_state.speech_ended_event.set()
+
+                # Conversation item events
                 elif t == "conversation.item.created":
                     item_type = raw_evt.get("item", {}).get("type")
-                    safe_print(f"[conversation_item] Created: {item_type}")
+                    safe_print(f"[realtime_event] conversation.item.created (type: {item_type})")
+                elif t == "conversation.item.added":
+                    item_type = raw_evt.get("item", {}).get("type")
+                    safe_print(f"[realtime_event] conversation.item.added (type: {item_type})")
+                elif t == "conversation.item.done":
+                    item_type = raw_evt.get("item", {}).get("type")
+                    safe_print(f"[realtime_event] conversation.item.done (type: {item_type})")
+
+                # Response events
                 elif t == "response.created":
-                    safe_print(f"[response_created] OpenAI started creating response")
+                    safe_print(f"[realtime_event] response.created")
                 elif t == "response.done":
-                    safe_print(f"[response_done] OpenAI finished response")
+                    safe_print(f"[realtime_event] response.done")
+                elif t == "response.output_item.added":
+                    safe_print(f"[realtime_event] response.output_item.added")
+                elif t == "response.output_item.done":
+                    safe_print(f"[realtime_event] response.output_item.done")
+                elif t == "response.content_part.added":
+                    safe_print(f"[realtime_event] response.content_part.added")
+                elif t == "response.content_part.done":
+                    safe_print(f"[realtime_event] response.content_part.done")
+
+                # Rate limits
+                elif t == "rate_limits.updated":
+                    safe_print(f"[realtime_event] rate_limits.updated")
 
                 # Keep errors visible
                 elif t == "error":
-                    safe_print(f"\n[raw_error] {raw_evt}\n")
+                    safe_print(f"\n[realtime_error] {raw_evt}\n")
 
-                # Log unhandled events for debugging (commented out to reduce spam)
-                # Uncomment this to see ALL events coming from OpenAI
-                # else:
-                #     safe_print(f"[raw_event:{t}] {_truncate(str(raw_evt))}")
-
-                # Otherwise: ignore most raw spam (session.updated, rate_limits, etc.)
+                # Log any other unhandled events
                 else:
+                    # Uncomment to see ALL raw events:
+                    # safe_print(f"[realtime_event] {t}")
                     pass
         else:
             # If something new appears, we'll see it.
@@ -1300,16 +1560,22 @@ async def main():
     with trace("realtime_halfred", metadata={"app": "Realtime_HALfred", "transport": "websocket"}):
         async with AsyncExitStack() as stack:
             # Bring up any MCP servers described in MCP_SERVERS.json so the agent
-            # can call their tools (automation, feedback-loop, filesystem demo, etc.).
+            # can call their tools (computer-control, feedback-loop, filesystem demo, etc.).
             mcp_servers = await init_mcp_servers(stack)
 
-            # Initialize display detection (works with PyAutoGUI fallback even if automation-mcp disabled)
+            # Initialize display detection in background (non-blocking, silent on success)
             if AUTOMATION_SAFETY_AVAILABLE:
-                try:
-                    await init_display_detection(mcp_servers)
-                    print("[automation_safety] Display detection initialized")
-                except Exception as e:
-                    print(f"[automation_safety] Display detection failed: {e}")
+                async def _init_display_detection_background():
+                    """Background task to initialize display detection."""
+                    try:
+                        # Run silently - only print on failure to avoid interrupting user input
+                        await init_display_detection(mcp_servers)
+                        # Success is silent - display detection ready for /screeninfo and /demo_click
+                    except Exception as e:
+                        print(f"\n[automation_safety] ✗ Display detection failed: {e}")
+
+                # Start background task (non-blocking)
+                asyncio.create_task(_init_display_detection_background())
 
             # Build user-specific context
             user_info = f"Maintain continuity when talking to {user_name}"
@@ -1390,13 +1656,15 @@ async def main():
                 "- Always explain actions and reasoning for shell commands.\n"
                 "\n"
                 "# Screen Tools\n"
-                "- `screenshot`: Capture and see the screen whenever needed (use freely, no approval required).\n"
+                "- `take_screenshot`: Capture and see the screen whenever needed (use freely, no approval required).\n"
                 "    - Use this tool any time you need visual context about what's on screen.\n"
-                "    - Captures full screen by default, or specific regions/windows if needed.\n"
+                "    - Captures full screen by default, or specific regions if provided.\n"
                 "    - This is your primary way to see what the user sees.\n"
+                "    - The screenshot is automatically sent to you as an image so you can see it.\n"
+                "    - Returns metadata (path, dimensions) - the image itself is sent separately.\n"
                 "- `analyze_screen`: ONLY use when user explicitly asks you to analyze screen content.\n"
                 "    - This pre-processes the screen through AI and returns text analysis.\n"
-                "    - Not for general use - prefer `screenshot` for normal visual inspection.\n"
+                "    - Not for general use - prefer `take_screenshot` for normal visual inspection.\n"
                 "- `create_stream`, `get_performance_metrics`: for real-time monitoring and system health tracking.\n"
                 "\n"
                 "# Desktop Automation\n"
@@ -1427,6 +1695,9 @@ async def main():
             if AUTOMATION_SAFETY_AVAILABLE and safe_action is not None:
                 agent_tools.append(safe_action)
                 print("[automation_safety] safe_action tool registered")
+            if NATIVE_SCREENSHOT_AVAILABLE and take_screenshot is not None:
+                agent_tools.append(take_screenshot)
+                print("[native_screenshot] take_screenshot tool registered")
 
             # Load push-to-talk configuration (needs to be early to configure turn detection)
             ptt_enabled = os.getenv("PTT_ENABLED", "false").lower() == "true"
@@ -1542,12 +1813,17 @@ async def main():
             try:
                 async with session:
                     print("✅ Realtime session started (using ElevenLabs TTS).")
-                    # Run console input, event handling, and mic streaming at the same time.
+                    # Initialize connection health timestamp
+                    listen_state.last_server_event_time = time.monotonic()
+
+                    # Run console input, event handling, mic streaming, and connection monitoring at the same time.
                     # These tasks all share the session/player/mic/tts objects defined above.
                     t1 = asyncio.create_task(user_input_loop(session, mic, player, listen_state, mcp_servers, ptt_state, tts))
                     t2 = asyncio.create_task(event_loop(session, player, mic, listen_state, tts))
                     t3 = asyncio.create_task(mic_send_loop(session, mic, listen_state))
-                    done, pending = await asyncio.wait({t1, t2, t3}, return_when=asyncio.FIRST_COMPLETED)
+                    t4 = asyncio.create_task(connection_health_monitor(listen_state))
+                    t5 = asyncio.create_task(keepalive_loop(session, mic, listen_state))
+                    done, pending = await asyncio.wait({t1, t2, t3, t4, t5}, return_when=asyncio.FIRST_COMPLETED)
                     for task in pending:
                         task.cancel()
             finally:

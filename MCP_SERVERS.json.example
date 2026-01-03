@@ -24,15 +24,15 @@
     "comment": "✅ STABLE - Terminal command execution with safety controls. Works on Windows (cmd.exe), macOS, and Linux (bash)."
   },
   {
-    "name": "automation",
+    "name": "computer-control",
     "transport": "stdio",
     "params": {
-      "command": "bun",
-      "args": ["run", "node_modules/automation-mcp/index.ts", "--stdio"],
+      "command": "uvx",
+      "args": ["computer-control-mcp@latest"],
       "env": {}
     },
     "client_session_timeout_seconds": 600,
-    "comment": "⚠️ EXPERIMENTAL - Desktop automation with 20 tools (mouseClick, type, screenshot, etc.). Requires: (1) bun runtime, (2) npm install, (3) FastMCP patch (see docs/FASTMCP_PATCH.md), (4) macOS permissions (Accessibility + Screen Recording). Only loads if ENABLE_AUTOMATION_MCP=true in .env"
+    "comment": "✅ STABLE - Desktop automation using PyAutoGUI (mouse, keyboard, OCR, screenshots). Requires: macOS/Linux/Windows permissions (Accessibility + Screen Recording on macOS). Only loads if ENABLE_COMPUTER_CONTROL_MCP=true in .env"
   },
   {
     "name": "feedback-loop",

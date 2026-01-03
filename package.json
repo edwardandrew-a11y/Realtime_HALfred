@@ -1,9 +1,8 @@
 {
   "name": "realtime-halfred",
-  "version": "0.6.0",
-  "description": "Desktop automation dependencies for Realtime HALfred",
+  "version": "0.15.0",
+  "description": "Feedback loop dependencies for Realtime HALfred (automation now via computer-control-mcp/uvx)",
   "dependencies": {
-    "automation-mcp": "github:ashwwwin/automation-mcp",
     "feedback-loop-mcp": "^1.0.0"
   },
   "devDependencies": {},
@@ -19,8 +18,7 @@
   },
   "keywords": [
     "mcp",
-    "automation",
-    "desktop-automation",
+    "feedback-loop",
     "human-in-the-loop"
   ],
   "author": "Andrew Huckleby",

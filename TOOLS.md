@@ -2,28 +2,29 @@
 
 This document describes all tools available to the HALfred agent, organized by source.
 
-**Last Updated:** 2025-12-27
-**Total Tools Available:** 50
+**Last Updated:** 2025-12-29
+**Total Tools Available:** 44
 
 ---
 
 ## Current Configuration
 
-### ✅ **Tools Currently Provided to Agent: 50/50**
+### ✅ **Tools Currently Provided to Agent: 44/44**
 
 All tools from all sources are currently being sent to the OpenAI Realtime API agent.
 
 **Breakdown:**
-- ✅ **Native Python Tools:** 2/2 provided
+- ✅ **Native Python Tools:** 3/3 provided
   - `local_time`
   - `safe_action`
+  - `take_screenshot` (native OS screenshot tool)
 - ✅ **ScreenMonitorMCP Tools:** 26/26 provided
   - All screen analysis, streaming, memory, and system monitoring tools
 - ✅ **PTY Proxy Tools:** 1/1 provided
   - `pty_bash_execute`
-- ✅ **Automation MCP Tools:** 20/20 provided
-  - All mouse, keyboard, screen, window, and advanced automation tools
-  - Requires: `ENABLE_AUTOMATION_MCP=true` in `.env`
+- ✅ **Computer-Control MCP Tools:** 13/13 provided
+  - Mouse, keyboard, window control, and OCR tools (screenshot tools replaced by native implementation)
+  - Requires: `ENABLE_COMPUTER_CONTROL_MCP=true` in `.env`
 - ✅ **Feedback Loop MCP Tools:** 1/1 provided
   - `feedback_loop`
   - Requires: `ENABLE_FEEDBACK_LOOP_MCP=true` in `.env`
@@ -32,14 +33,14 @@ All tools from all sources are currently being sent to the OpenAI Realtime API a
 
 | MCP Server | Status | Tool Count | Config Required |
 |------------|--------|------------|-----------------|
-| Native Python | ✅ Always On | 2 | None |
+| Native Python | ✅ Always On | 3 | None |
 | ScreenMonitorMCP | ✅ Always On | 26 | None |
 | PTY Proxy | ✅ Always On | 1 | None |
-| Automation MCP | ✅ **Enabled** | 20 | `ENABLE_AUTOMATION_MCP=true` |
+| Computer-Control MCP | ✅ **Enabled** | 13 | `ENABLE_COMPUTER_CONTROL_MCP=true` |
 | Feedback Loop MCP | ✅ **Enabled** | 1 | `ENABLE_FEEDBACK_LOOP_MCP=true` |
 
-**Note:** While all 50 tools are technically available to the agent, usage guidelines in the prompt instruct when each tool should be used. For example:
-- `screenshot` - Use freely whenever visual context is needed
+**Note:** While all 44 tools are technically available to the agent, usage guidelines in the prompt instruct when each tool should be used. For example:
+- `take_screenshot` - Use freely whenever visual context is needed (native OS implementation)
 - `analyze_screen` - Only when user explicitly requests screen analysis
 - `safe_action` - For all desktop automation with user confirmation
 
@@ -48,10 +49,10 @@ All tools from all sources are currently being sent to the OpenAI Realtime API a
 ## Table of Contents
 
 - [Current Configuration](#current-configuration)
-- [Native Python Tools](#native-python-tools) (2 tools)
+- [Native Python Tools](#native-python-tools) (3 tools)
 - [ScreenMonitorMCP Tools](#screenmonitormcp-tools) (26 tools)
 - [PTY Proxy Tools](#pty-proxy-tools) (1 tool)
-- [Automation MCP Tools](#automation-mcp-tools) (20 tools)
+- [Computer-Control MCP Tools](#computer-control-mcp-tools) (13 tools)
 - [Feedback Loop MCP Tools](#feedback-loop-mcp-tools) (1 tool)
 - [Tool Usage Guidelines](#tool-usage-guidelines)
 
@@ -122,6 +123,58 @@ Execute a desktop automation action with safety confirmation. This tool automati
 - State-changing actions require on-screen user confirmation
 - Read-only actions execute automatically
 - Always brief the user before using and confirm results after
+
+---
+
+### 3. `take_screenshot`
+
+**Source:** `native_screenshot.py`
+**Status:** ✅ Always Enabled
+
+**Description:**
+Capture a screenshot using native OS APIs and save it to the `screenshots/` directory. The tool returns only metadata (file path, dimensions, timestamp) and does NOT include base64-encoded image data in the response. The screenshot image is automatically sent to the Realtime API as a visual input so the agent can see what's on screen.
+
+**Parameters:**
+- `region` (optional, string): Region to capture in format "x,y,width,height" (e.g., "0,0,1920,1080"). If not specified, captures the full screen.
+- `description` (optional, string): Human-readable description of what this screenshot is for.
+
+**Returns:**
+JSON string with screenshot metadata:
+```json
+{
+  "success": true,
+  "path": "screenshots/screenshot_20250129_143025_123.png",
+  "filename": "screenshot_20250129_143025_123.png",
+  "width": 1920,
+  "height": 1080,
+  "timestamp": "2025-01-29T14:30:25.123",
+  "description": "Optional description"
+}
+```
+
+**Platform Support:**
+- **macOS:** Uses native `screencapture` command (fast, no dependencies)
+- **Windows/Linux:** Uses PIL/Pillow (requires: `pip install Pillow`)
+
+**When to Use:**
+- Any time you need visual context about what's on screen
+- This is your primary way to see what the user sees
+- Use freely - no approval required
+- The image is automatically sent to you for visual analysis
+
+**Usage Guidelines:**
+- Captures full screen by default
+- Can capture specific regions by providing coordinates
+- Screenshots are saved to `screenshots/` directory with timestamp filenames
+- The agent receives both the metadata AND the actual screenshot image
+- Prefer this over `analyze_screen` for general visual inspection
+
+**Examples:**
+```python
+take_screenshot()  # Capture full screen
+take_screenshot(region="100,100,800,600")  # Capture specific region
+take_screenshot(description="Browser window showing error message")
+```
 
 ---
 
@@ -498,285 +551,166 @@ Execute a desktop automation action with safety confirmation. This tool automati
 
 ---
 
-## Automation MCP Tools
+## Computer-Control MCP Tools
 
-**Source:** `node_modules/automation-mcp/`
-**Status:** ✅ Always Enabled (ENABLE_AUTOMATION_MCP=true)
-**Total:** 20 tools
+**Source:** `computer-control-mcp` via uvx
+**Status:** ✅ Always Enabled (ENABLE_COMPUTER_CONTROL_MCP=true)
+**Total:** 13 tools
 
-### Mouse Control Tools (7 tools)
+**Note:** The screenshot tools (`take_screenshot`, `take_screenshot_with_ocr`) have been replaced by the native `take_screenshot` tool for better performance and Realtime API integration.
 
-#### `mouseClick`
+### Mouse Control Tools (5 tools)
 
-**Description:** Simulate a mouse click at the given screen coordinates.
+#### `click_screen`
+
+**Description:** Click at specified screen coordinates.
 
 **Parameters:**
-- `x` (required, number): Horizontal screen coordinate (pixels)
-- `y` (required, number): Vertical screen coordinate (pixels)
-- `button` (optional, enum, default: "left"): Mouse button to click
-  - `"left"`
-  - `"right"`
-  - `"middle"`
+- `x` (required, integer): Horizontal screen coordinate (pixels)
+- `y` (required, integer): Vertical screen coordinate (pixels)
 
 ---
 
-#### `mouseDoubleClick`
+#### `move_mouse`
 
-**Description:** Simulate a mouse double-click at the given screen coordinates.
+**Description:** Move mouse cursor to specified coordinates.
 
 **Parameters:**
-- `x` (required, number): Horizontal screen coordinate (pixels)
-- `y` (required, number): Vertical screen coordinate (pixels)
-- `button` (optional, enum, default: "left"): Mouse button to double-click
-  - `"left"`
-  - `"right"`
-  - `"middle"`
+- `x` (required, integer): Horizontal screen coordinate (pixels)
+- `y` (required, integer): Vertical screen coordinate (pixels)
 
 ---
 
-#### `mouseMove`
+#### `drag_mouse`
 
-**Description:** Move the mouse to specific coordinates.
+**Description:** Drag mouse from one position to another.
 
 **Parameters:**
-- `x` (required, number): Horizontal screen coordinate (pixels)
-- `y` (required, number): Vertical screen coordinate (pixels)
+- `from_x` (required, integer): Starting horizontal coordinate
+- `from_y` (required, integer): Starting vertical coordinate
+- `to_x` (required, integer): Ending horizontal coordinate
+- `to_y` (required, integer): Ending vertical coordinate
+- `duration` (optional, number, default: 0.5): Duration of drag in seconds
 
 ---
 
-#### `mouseGetPosition`
+#### `mouse_down`
 
-**Description:** Get the current mouse cursor position.
+**Description:** Hold down a mouse button.
+
+**Parameters:**
+- `button` (optional, string, default: "left"): Mouse button to press ("left", "right", "middle")
+
+---
+
+#### `mouse_up`
+
+**Description:** Release a mouse button.
+
+**Parameters:**
+- `button` (optional, string, default: "left"): Mouse button to release ("left", "right", "middle")
+
+---
+
+### Keyboard Control Tools (5 tools)
+
+#### `type_text`
+
+**Description:** Type the specified text at current cursor position.
+
+**Parameters:**
+- `text` (required, string): Literal text to type
+
+---
+
+#### `press_key`
+
+**Description:** Press a specified keyboard key.
+
+**Parameters:**
+- `key` (required, string): Key name to press (e.g., "enter", "tab", "escape")
+
+---
+
+#### `key_down`
+
+**Description:** Hold down a specific keyboard key until released.
+
+**Parameters:**
+- `key` (required, string): Key name to hold down
+
+---
+
+#### `key_up`
+
+**Description:** Release a specific keyboard key.
+
+**Parameters:**
+- `key` (required, string): Key name to release
+
+---
+
+#### `press_keys`
+
+**Description:** Press keyboard keys (supports single keys, sequences, and combinations).
+
+**Parameters:**
+- `keys` (required, string or array): Key names to press simultaneously (e.g., "ctrl,c" or ["ctrl", "c"])
+
+**Examples:**
+- Single key: `press_keys(keys="enter")`
+- Combination: `press_keys(keys="ctrl,c")` for copy
+- Sequence: `press_keys(keys=["cmd", "shift", "4"])` for screenshot on macOS
+
+---
+
+### Screen and Window Management Tools (3 tools)
+
+**Note:** Screenshot tools have been moved to native Python tools for better Realtime API integration.
+
+#### `get_screen_size`
+
+**Description:** Get current screen resolution.
 
 **Parameters:** None
 
-**Returns:** Current mouse coordinates
+**Returns:** Screen width and height
 
 ---
 
-#### `mouseScroll`
+#### `list_windows`
 
-**Description:** Scroll the mouse wheel in a specified direction.
-
-**Parameters:**
-- `direction` (required, enum): Direction to scroll
-  - `"up"`
-  - `"down"`
-  - `"left"`
-  - `"right"`
-- `amount` (optional, number, default: 3): Number of scroll steps
-
----
-
-#### `mouseDrag`
-
-**Description:** Drag the mouse from current position to target coordinates.
-
-**Parameters:**
-- `x` (required, number): Target horizontal coordinate (pixels)
-- `y` (required, number): Target vertical coordinate (pixels)
-
----
-
-#### `mouseButtonControl`
-
-**Description:** Press or release a mouse button without clicking.
-
-**Parameters:**
-- `action` (required, enum): Action to perform
-  - `"press"`
-  - `"release"`
-- `button` (optional, enum, default: "left"): Mouse button to control
-  - `"left"`
-  - `"right"`
-  - `"middle"`
-
----
-
-### Keyboard Control Tools (2 tools)
-
-#### `keyboard_type`
-
-**Description:** Simulate typing text or pressing key combinations. Provide either 'text' to type literal text, OR 'keys' as comma-separated key names for key combinations (not both).
-
-**Parameters (mutually exclusive):**
-- `text` (string, min length 1): Literal text to type
-  - **OR**
-- `keys` (string, min length 1): Comma-separated key names to press simultaneously (e.g. 'LeftControl,C')
-
-**Note:** Schema enforces exactly one of `text` OR `keys` must be provided.
-
----
-
-#### `keyControl`
-
-**Description:** Press or release specific keys for advanced key combinations.
-
-**Parameters:**
-- `action` (required, enum): Action to perform
-  - `"press"`
-  - `"release"`
-- `keys` (required, string): Comma-separated key names to control (e.g. 'LeftControl,LeftShift')
-
----
-
-### Screen Tools (4 tools)
-
-#### `screenshot`
-
-**Description:** Capture a screenshot (full screen, region, or window). Default to full screen if no preference. This will also provide information about the user's screen in order to correctly position mouse clicks and keyboard inputs.
-
-**Parameters:**
-- `mode` (optional, enum, default: "full"): Capture mode
-  - `"full"` - Entire screen
-  - `"region"` - Specific region
-  - `"window"` - Specific window
-- `regionX` (optional, number): Region X coordinate (for region mode)
-- `regionY` (optional, number): Region Y coordinate (for region mode)
-- `regionWidth` (optional, number): Region width (for region mode)
-- `regionHeight` (optional, number): Region height (for region mode)
-- `windowName` (optional, string): Window title (if mode=window)
-- `windowId` (optional, number): Window ID (if mode=window)
-
-**Returns:** Screenshot image + screen dimensions
-
-**When to Use:**
-- ✅ **Use freely, no approval required**
-- Use any time you need visual context about what's on screen
-- Your primary way to see what the user sees
-- For UI automation (finding buttons, reading coordinates)
-- For understanding screen layout and content
-
-**Important:** This is the agent's primary visual tool. Use it whenever you need to see the screen.
-
----
-
-#### `screenInfo`
-
-**Description:** Get screen dimensions and information.
+**Description:** List all open windows.
 
 **Parameters:** None
 
-**Returns:** Screen width, height, and configuration
+**Returns:** List of all open windows with titles and properties
 
 ---
 
-#### `screenHighlight`
+#### `activate_window`
 
-**Description:** Highlight a region on the screen for visual feedback.
+**Description:** Bring specified window to foreground.
 
 **Parameters:**
-- `x` (required, number): Left coordinate of region
-- `y` (required, number): Top coordinate of region
-- `width` (required, number): Width of region
-- `height` (required, number): Height of region
+- `title_pattern` (required, string): Window title pattern to activate
+- `use_regex` (optional, boolean, default: false): Use regex for title matching
+- `threshold` (optional, integer, default: 60): Fuzzy match threshold for window title
 
 ---
 
-#### `colorAt`
+### Utility Tool (1 tool)
 
-**Description:** Get the color of a pixel at specific screen coordinates.
+#### `wait_milliseconds`
+
+**Description:** Wait for a specified number of milliseconds.
 
 **Parameters:**
-- `x` (required, number): X coordinate
-- `y` (required, number): Y coordinate
-
-**Returns:** RGB color values
+- `milliseconds` (required, integer): Time to wait in milliseconds
 
 ---
 
-### Window Management Tools (3 tools)
-
-#### `getWindows`
-
-**Description:** Get information about all open windows.
-
-**Parameters:** None
-
-**Returns:** List of all open windows with titles and IDs
-
----
-
-#### `getActiveWindow`
-
-**Description:** Get information about the currently active window.
-
-**Parameters:** None
-
-**Returns:** Active window information
-
----
-
-#### `windowControl`
-
-**Description:** Control a window (focus, move, resize, minimize, restore).
-
-**Parameters:**
-- `action` (required, enum): Action to perform
-  - `"focus"`
-  - `"move"`
-  - `"resize"`
-  - `"minimize"`
-  - `"restore"`
-- `windowTitle` (optional, string): Window title to target (uses active window if not provided)
-- `x` (optional, number): X coordinate for move action
-- `y` (optional, number): Y coordinate for move action
-- `width` (optional, number): Width for resize action
-- `height` (optional, number): Height for resize action
-
----
-
-### Advanced Automation Tools (4 tools)
-
-#### `waitForImage`
-
-**Description:** Wait for an image to appear on screen and return its location.
-
-**Parameters:**
-- `imagePath` (required, string): Path to the template image file
-- `timeoutMs` (optional, number, default: 5000): Timeout in milliseconds
-- `confidence` (optional, number, default: 0.8): Match confidence (0-1)
-
-**Returns:** Image location coordinates
-
----
-
-#### `sleep`
-
-**Description:** Pause execution for a specified amount of time.
-
-**Parameters:**
-- `ms` (required, number): Time to sleep in milliseconds
-
----
-
-#### `mouseMovePath`
-
-**Description:** Move mouse along a path of coordinates with smooth animation.
-
-**Parameters:**
-- `path` (required, array of numbers): Array of coordinates to move through (alternating x,y values: [x1,y1,x2,y2,...])
-
----
-
-#### `systemCommand`
-
-**Description:** Execute common system key combinations (copy, paste, undo, etc.).
-
-**Parameters:**
-- `command` (required, enum): System command to execute
-  - `"copy"`
-  - `"paste"`
-  - `"cut"`
-  - `"undo"`
-  - `"redo"`
-  - `"selectAll"`
-  - `"save"`
-  - `"quit"`
-  - `"minimize"`
-  - `"switchApp"`
-  - `"newTab"`
-  - `"closeTab"`
+**Note:** Computer-Control-MCP is run via `uvx computer-control-mcp@latest` and provides cross-platform desktop automation using PyAutoGUI, RapidOCR, and ONNXRuntime.
 
 ---
 
@@ -864,7 +798,7 @@ User may interrupt, jump topics, or give commands anytime. Each input restarts t
 
 - **MCP Servers:** `MCP_SERVERS.json`
 - **Environment:** `.env`
-  - `ENABLE_AUTOMATION_MCP=true`
+  - `ENABLE_COMPUTER_CONTROL_MCP=true`
   - `ENABLE_FEEDBACK_LOOP_MCP=true`
   - `AUTOMATION_REQUIRE_APPROVAL=true`
 
@@ -872,13 +806,14 @@ User may interrupt, jump topics, or give commands anytime. Each input restarts t
 
 ## Notes
 
-- Total of 50 tools available to the agent
+- Total of 45 tools available to the agent
 - All tools use OpenAI function calling JSON Schema format
 - Tools are sent as a flat list to the Realtime API
 - Conditional requirements implemented via JSON Schema `allOf` for `safe_action`
 - Enums enforced for action types, detail levels, and format options
+- Computer-Control-MCP provides cross-platform automation via PyAutoGUI
 
 ---
 
-**Last Updated:** 2025-12-27
-**Agent Version:** HALfred v0.10
+**Last Updated:** 2025-12-29
+**Agent Version:** HALfred v0.15

@@ -1,3 +1,30 @@
+# ⚠️ DEPRECATION NOTICE
+
+**This document describes the old automation-mcp integration, which has been replaced with computer-control-mcp.**
+
+**What changed:**
+- ❌ **Removed:** `automation-mcp` (Node.js/Bun-based, 20 tools)
+- ✅ **Added:** `computer-control-mcp` (Python/uvx-based, 15 tools)
+
+**Benefits of computer-control-mcp:**
+- ✅ Cross-platform (macOS, Windows, Linux)
+- ✅ No Node.js/Bun runtime required
+- ✅ No FastMCP patch needed
+- ✅ Simpler installation via `pip install uv`
+- ✅ Stable PyAutoGUI backend
+
+**For current documentation, see:**
+- [README.md](../README.md) - Updated setup and usage
+- [TOOLS.md](../TOOLS.md) - Complete tool documentation
+
+**This file is kept for reference only and may contain outdated information.**
+
+---
+
+**Original documentation below:**
+
+---
+
 # FastMCP Compatibility Patch
 
 ## Issue
