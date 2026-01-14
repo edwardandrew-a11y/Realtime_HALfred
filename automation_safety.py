@@ -5,9 +5,9 @@ This module provides a composite safe_action() tool that orchestrates:
 1. Screenshot capture
 2. Target highlighting
 3. User confirmation via feedback-loop-mcp
-4. Action execution via computer-control-mcp
+4. Action execution via macos-automator-mcp
 
-Cross-platform support with computer-control-mcp (PyAutoGUI-based) for all platforms.
+macOS-only support using native AppleScript/JXA and accessibility APIs.
 """
 
 import asyncio
@@ -71,7 +71,7 @@ async def call_mcp_tool(
     Call an MCP tool by server name and tool name.
 
     Args:
-        server_name: Name of the MCP server (e.g., "computer-control", "feedback-loop")
+        server_name: Name of the MCP server (e.g., "macos-automator", "feedback-loop")
         tool_name: Name of the tool to call
         args: Arguments dictionary for the tool
         mcp_servers: List of initialized MCP server objects
@@ -96,11 +96,37 @@ async def call_mcp_tool(
         raise Exception(f"Failed to call tool '{tool_name}' on server '{server_name}': {e}")
 
 
+async def execute_applescript(script: str, mcp_servers: List[Any]) -> str:
+    """
+    Execute an AppleScript using macos-automator-mcp.
+
+    Args:
+        script: AppleScript code to execute
+        mcp_servers: List of MCP servers
+
+    Returns:
+        Script execution result as text
+    """
+    try:
+        result = await call_mcp_tool(
+            "macos-automator",
+            "execute_script",
+            {"input": {"script_content": script}},
+            mcp_servers
+        )
+
+        if hasattr(result, 'content') and result.content:
+            return result.content[0].text
+        return ""
+    except Exception as e:
+        raise Exception(f"AppleScript execution failed: {e}")
+
+
 async def init_display_detection(mcp_servers: List[Any]) -> Optional[DisplayInfo]:
     """
-    Initialize display detection by querying computer-control-mcp for screen info.
+    Initialize display detection by querying macos-automator-mcp for screen info.
 
-    This should be called once on startup if ENABLE_COMPUTER_CONTROL_MCP=true.
+    This should be called once on startup if ENABLE_MACOS_AUTOMATOR_MCP=true.
 
     Args:
         mcp_servers: List of initialized MCP server objects
@@ -112,62 +138,56 @@ async def init_display_detection(mcp_servers: List[Any]) -> Optional[DisplayInfo
 
     _mcp_servers_cache = mcp_servers
 
-    # Check if computer-control MCP is available
-    automation_server = await find_mcp_server("computer-control", mcp_servers)
+    # Check if macos-automator MCP is available
+    automation_server = await find_mcp_server("macos-automator", mcp_servers)
     if not automation_server:
-        print("[automation_safety] computer-control-mcp not available, using PyAutoGUI fallback")
-        # Create display info using PyAutoGUI
-        try:
-            import pyautogui
-            screen_size = pyautogui.size()
-            _display_info = DisplayInfo(
-                screens=[{"x": 0, "y": 0, "width": screen_size.width, "height": screen_size.height}],
-                active_window=None
-            )
-            # Silently detected (avoid interrupting user input)
-            return _display_info
-        except ImportError:
-            print("[automation_safety] Warning: PyAutoGUI not available. Using default screen size.")
-            _display_info = DisplayInfo(
-                screens=[{"x": 0, "y": 0, "width": 1920, "height": 1080}],
-                active_window=None
-            )
-            return _display_info
+        print("[automation_safety] macos-automator-mcp not available")
+        # Create default display info
+        _display_info = DisplayInfo(
+            screens=[{"x": 0, "y": 0, "width": 1920, "height": 1080}],
+            active_window=None
+        )
+        return _display_info
 
     try:
-        # Get screen info from computer-control-mcp
-        screen_result = await call_mcp_tool("computer-control", "get_screen_size", {}, mcp_servers)
+        # Get screen size using AppleScript
+        screen_script = """
+tell application "Finder"
+    set screenBounds to bounds of window of desktop
+    set screenWidth to item 3 of screenBounds
+    set screenHeight to item 4 of screenBounds
+    return "width: " & screenWidth & ", height: " & screenHeight
+end tell
+"""
+        screen_result = await execute_applescript(screen_script, mcp_servers)
 
-        # Parse screen info - computer-control-mcp returns text content
-        # Format: {"content": [{"type": "text", "text": "..."}]}
+        # Parse screen info
         screens = []
-        if hasattr(screen_result, 'content') and screen_result.content:
-            # Parse the text response
-            text = screen_result.content[0].text if screen_result.content else ""
-            # Try to extract width and height from response
-            # Expected format: "width: 1920, height: 1080" or similar
-            import re
-            width_match = re.search(r'width[:\s]+(\d+)', text, re.IGNORECASE)
-            height_match = re.search(r'height[:\s]+(\d+)', text, re.IGNORECASE)
-            if width_match and height_match:
-                width = int(width_match.group(1))
-                height = int(height_match.group(1))
-                screens.append({"x": 0, "y": 0, "width": width, "height": height})
-            else:
-                # Fallback to default screen size
-                screens.append({"x": 0, "y": 0, "width": 1920, "height": 1080})
+        import re
+        width_match = re.search(r'width[:\s]+(\d+)', screen_result, re.IGNORECASE)
+        height_match = re.search(r'height[:\s]+(\d+)', screen_result, re.IGNORECASE)
+        if width_match and height_match:
+            width = int(width_match.group(1))
+            height = int(height_match.group(1))
+            screens.append({"x": 0, "y": 0, "width": width, "height": height})
         else:
             # Fallback to default screen size
             screens.append({"x": 0, "y": 0, "width": 1920, "height": 1080})
 
-        # Get active window
-        active_window = None
+        # Get active window using AppleScript
+        window_script = """
+tell application "System Events"
+    set frontApp to name of first application process whose frontmost is true
+    set frontWin to name of front window of application process frontApp
+    return frontApp & " - " & frontWin
+end tell
+"""
         try:
-            window_result = await call_mcp_tool("computer-control", "list_windows", {}, mcp_servers)
-            if hasattr(window_result, 'content') and window_result.content:
-                active_window = {"info": window_result.content[0].text}
+            window_result = await execute_applescript(window_script, mcp_servers)
+            active_window = {"info": window_result}
         except Exception as e:
-            print(f"[automation_safety] Could not get windows list: {e}")
+            print(f"[automation_safety] Could not get active window: {e}")
+            active_window = None
 
         _display_info = DisplayInfo(
             screens=screens,
@@ -188,7 +208,7 @@ async def init_display_detection(mcp_servers: List[Any]) -> Optional[DisplayInfo
 
 async def take_screenshot(mcp_servers: List[Any], mode: str = "full") -> str:
     """
-    Take a screenshot using computer-control-mcp or fallback methods.
+    Take a screenshot using macos-automator-mcp.
 
     Args:
         mcp_servers: List of MCP servers
@@ -198,28 +218,24 @@ async def take_screenshot(mcp_servers: List[Any], mode: str = "full") -> str:
         Success message or error string
     """
     try:
-        automation_server = await find_mcp_server("computer-control", mcp_servers)
+        automation_server = await find_mcp_server("macos-automator", mcp_servers)
 
         if automation_server:
-            # Use computer-control-mcp screenshot (no parameters needed for full screen)
-            result = await call_mcp_tool("computer-control", "take_screenshot", {}, mcp_servers)
-            if hasattr(result, 'content') and result.content:
-                # computer-control-mcp returns ImageContent, not TextContent
-                content_item = result.content[0]
-                if hasattr(content_item, 'text'):
-                    return f"Screenshot captured: {content_item.text}"
-                else:
-                    # ImageContent - screenshot was captured successfully
-                    return "Screenshot captured successfully (image data returned)"
-            return "Screenshot captured successfully"
+            # Use AppleScript to take screenshot
+            screenshot_dir = os.getenv("SCREENSHOTS_DIR", "screenshots")
+            os.makedirs(screenshot_dir, exist_ok=True)
+
+            import datetime
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filepath = os.path.join(screenshot_dir, f"screenshot_{timestamp}.png")
+
+            # Use screencapture command via AppleScript
+            script = f'do shell script "screencapture -x {filepath}"'
+
+            await execute_applescript(script, mcp_servers)
+            return f"Screenshot saved to {filepath}"
         else:
-            # Fallback: Try pyautogui
-            try:
-                import pyautogui
-                screenshot = pyautogui.screenshot()
-                return f"Screenshot captured ({screenshot.width}x{screenshot.height})"
-            except ImportError:
-                return "Screenshot unavailable (install pyautogui for fallback)"
+            return "Screenshot unavailable (macos-automator-mcp not enabled)"
 
     except Exception as e:
         return f"Screenshot failed: {e}"
@@ -227,7 +243,7 @@ async def take_screenshot(mcp_servers: List[Any], mode: str = "full") -> str:
 
 async def highlight_region(mcp_servers: List[Any], x: int, y: int, w: int, h: int, duration: int = 2) -> None:
     """
-    Highlight a screen region (computer-control-mcp doesn't support this, so this is a no-op).
+    Highlight a screen region (not currently supported in macos-automator-mcp).
 
     Args:
         mcp_servers: List of MCP servers
@@ -235,9 +251,9 @@ async def highlight_region(mcp_servers: List[Any], x: int, y: int, w: int, h: in
         w, h: Width and height
         duration: Highlight duration in seconds
     """
-    # computer-control-mcp doesn't have a highlight feature
+    # Highlighting not currently implemented in macos-automator-mcp
     # This is a non-critical feature, so we'll just log and skip it
-    print(f"[automation_safety] Highlight not supported by computer-control-mcp (would highlight {x},{y} {w}x{h})")
+    print(f"[automation_safety] Highlight not yet implemented in macos-automator-mcp (would highlight {x},{y} {w}x{h})")
 
 
 async def request_confirmation(
@@ -352,14 +368,15 @@ async def safe_action(
     """
     global _mcp_servers_cache
 
-    # Desktop automation: prefer computer-control-mcp if available, fallback to PyAutoGUI
-    # Check if computer-control-mcp server is actually loaded
+    # Check if macos-automator-mcp server is actually loaded
     using_mcp = False
     for server in _mcp_servers_cache:
-        if getattr(server, 'name', '') == 'computer-control':
+        if getattr(server, 'name', '') == 'macos-automator':
             using_mcp = True
             break
-    automation_backend = "computer-control-mcp" if using_mcp else "PyAutoGUI"
+
+    if not using_mcp:
+        return "Error: macos-automator-mcp not available. Enable it in .env with ENABLE_MACOS_AUTOMATOR_MCP=true"
 
     # Check if approval is required
     require_approval = os.getenv("AUTOMATION_REQUIRE_APPROVAL", "true").lower() == "true"
@@ -416,64 +433,78 @@ Action: {action_type}
             if "Adjust" in response:
                 return f"Action adjustment requested: {description}. Please refine coordinates and try again."
 
-        # Step 4: Execute the action
+        # Step 4: Execute the action using AppleScript/JXA
         print(f"[safe_action] ✓ Executing action: {action_type}...")
 
-        automation_server = await find_mcp_server("computer-control", mcp_servers)
+        automation_server = await find_mcp_server("macos-automator", mcp_servers)
 
         if automation_server:
-            # Use computer-control-mcp
+            # Build AppleScript for the action
+            script = ""
+
             if action_type.lower() == "click":
-                result = await call_mcp_tool("computer-control", "click_screen", {"x": x, "y": y}, mcp_servers)
+                # Use cliclick for mouse clicks (requires cliclick: brew install cliclick)
+                script = f'do shell script "/opt/homebrew/bin/cliclick c:{x},{y}"'
+
             elif action_type.lower() == "double_click":
-                # computer-control-mcp doesn't have double-click, so we'll click twice
-                result = await call_mcp_tool("computer-control", "click_screen", {"x": x, "y": y}, mcp_servers)
-                await asyncio.sleep(0.1)  # Small delay between clicks
-                result = await call_mcp_tool("computer-control", "click_screen", {"x": x, "y": y}, mcp_servers)
+                # Double click using cliclick
+                script = f'do shell script "/opt/homebrew/bin/cliclick dc:{x},{y}"'
+
             elif action_type.lower() == "move":
-                result = await call_mcp_tool("computer-control", "move_mouse", {"x": x, "y": y}, mcp_servers)
+                # Move mouse using cliclick
+                script = f'do shell script "/opt/homebrew/bin/cliclick m:{x},{y}"'
+
             elif action_type.lower() == "type":
                 if not text:
                     return "Error: 'text' parameter required for type action"
-                result = await call_mcp_tool("computer-control", "type_text", {"text": text}, mcp_servers)
+                # Escape quotes in text
+                escaped_text = text.replace('"', '\\"')
+                script = f'''
+tell application "System Events"
+    keystroke "{escaped_text}"
+end tell
+'''
+
             elif action_type.lower() == "hotkey":
                 if not hotkey:
                     return "Error: 'hotkey' parameter required for hotkey action"
-                # Convert hotkey format (e.g., "cmd+c" to ["cmd", "c"])
-                keys = hotkey.replace("+", ",").replace(" ", "")
-                result = await call_mcp_tool("computer-control", "press_keys", {"keys": keys}, mcp_servers)
+
+                # Parse hotkey (e.g., "cmd+c" -> command down, c, command up)
+                parts = hotkey.lower().split('+')
+                modifiers = []
+                key = parts[-1]
+
+                for part in parts[:-1]:
+                    if part in ['cmd', 'command']:
+                        modifiers.append('command')
+                    elif part in ['ctrl', 'control']:
+                        modifiers.append('control')
+                    elif part in ['alt', 'option']:
+                        modifiers.append('option')
+                    elif part == 'shift':
+                        modifiers.append('shift')
+
+                modifier_str = ' using {' + ', '.join([f'{m} down' for m in modifiers]) + '}' if modifiers else ''
+                script = f'''
+tell application "System Events"
+    keystroke "{key}"{modifier_str}
+end tell
+'''
+
             elif action_type.lower() == "window_control":
                 if not window_title:
                     return "Error: 'window_title' parameter required for window_control action"
-                result = await call_mcp_tool("computer-control", "activate_window", {"title_pattern": window_title}, mcp_servers)
+                script = f'''
+tell application "System Events"
+    set frontmost of first application process whose name contains "{window_title}" to true
+end tell
+'''
 
-            if hasattr(result, 'content') and result.content:
-                result_text = result.content[0].text
-                return f"✅ Action completed successfully: {description}\nResult: {result_text}"
-            return f"✅ Action completed successfully: {description}"
+            # Execute the AppleScript
+            result_text = await execute_applescript(script, mcp_servers)
+            return f"✅ Action completed successfully: {description}\nResult: {result_text}"
         else:
-            # Fallback to pyautogui (Windows/Linux)
-            if not IS_MACOS:
-                try:
-                    import pyautogui
-
-                    if action_type.lower() == "click":
-                        pyautogui.click(x, y)
-                    elif action_type.lower() == "double_click":
-                        pyautogui.doubleClick(x, y)
-                    elif action_type.lower() == "move":
-                        pyautogui.moveTo(x, y)
-                    elif action_type.lower() == "type":
-                        pyautogui.write(text)
-                    elif action_type.lower() == "hotkey":
-                        keys = hotkey.replace("+", ",").split(",")
-                        pyautogui.hotkey(*keys)
-
-                    return f"✅ Action completed (fallback): {description}"
-                except ImportError:
-                    return "Error: computer-control-mcp not available and pyautogui not installed. Install with: pip install pyautogui"
-
-            return "Error: computer-control-mcp not available and no fallback available"
+            return "Error: macos-automator-mcp not available"
 
     except Exception as e:
         return f"❌ Action failed: {description}\nError: {str(e)}"

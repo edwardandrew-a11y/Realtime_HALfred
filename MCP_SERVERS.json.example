@@ -24,15 +24,17 @@
     "comment": "✅ STABLE - Terminal command execution with safety controls. Works on Windows (cmd.exe), macOS, and Linux (bash)."
   },
   {
-    "name": "computer-control",
+    "name": "macos-automator",
     "transport": "stdio",
     "params": {
-      "command": "uvx",
-      "args": ["computer-control-mcp@latest"],
-      "env": {}
+      "command": "/path/to/your/macos-automator-mcp/start.sh",
+      "args": [],
+      "env": {
+        "LOG_LEVEL": "ERROR"
+      }
     },
     "client_session_timeout_seconds": 600,
-    "comment": "✅ STABLE - Desktop automation using PyAutoGUI (mouse, keyboard, OCR, screenshots). Requires: macOS/Linux/Windows permissions (Accessibility + Screen Recording on macOS). Only loads if ENABLE_COMPUTER_CONTROL_MCP=true in .env"
+    "comment": "✅ PATCHED LOCAL - macOS native automation using AppleScript/JXA and accessibility APIs (execute_script, accessibility_query, get_scripting_tips). Running from locally compiled version with AXorcist binary built and symlinked. Includes all 3 tools with working accessibility_query. SETUP: Clone https://github.com/steipete/macos-automator-mcp, build AXorcist, run pnpm build, then update command path to your local start.sh. Requires: macOS Accessibility and Automation permissions. Only loads if ENABLE_MACOS_AUTOMATOR_MCP=true in .env."
   },
   {
     "name": "feedback-loop",

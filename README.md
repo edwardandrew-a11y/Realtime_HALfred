@@ -37,7 +37,8 @@ The following features have been extensively tested and are production-ready:
 
 ### Stable Desktop Automation
 The following desktop automation feature is now stable:
-- ✅ **Desktop Automation (computer-control-mcp)** - Cross-platform PyAutoGUI-based automation via uvx
+- ✅ **Desktop Automation (macos-automator-mcp)** - Native macOS automation via AppleScript/JXA and accessibility APIs
+  - **Note:** Replaced Computer-Control-MCP due to limitations in image processing and significant latency issues
 
 ### Experimental Features (Use with Caution)
 The following features are **experimental** and have not been fully tested:
@@ -100,7 +101,7 @@ Halfred has safe terminal access through the PTY proxy:
 
 ### Native Screenshot Tool
 
-**`take_screenshot`** - Fast, native OS screenshot capture with Realtime API integration
+**`screencapture`** - Fast, native OS screenshot capture with Realtime API integration
 
 HALfred can see your screen using a native screenshot tool that:
 - Captures screenshots using OS-native APIs (macOS `screencapture`, Windows/Linux PIL)
@@ -110,7 +111,7 @@ HALfred can see your screen using a native screenshot tool that:
 - Works seamlessly across all platforms
 
 **Two-Phase Screenshot Flow:**
-1. **Tool Phase:** `take_screenshot` captures screen → saves to disk → returns metadata JSON
+1. **Tool Phase:** `screencapture` captures screen → saves to disk → returns metadata JSON
 2. **Upload Phase:** Handler reads image file → sends to Realtime as `input_image` message
 
 **Why this approach?**
@@ -122,7 +123,7 @@ HALfred can see your screen using a native screenshot tool that:
 **Example Usage:**
 ```
 You> What's on my screen?
-HALfred> Let me take a look. [calls take_screenshot, receives image, describes what's visible]
+HALfred> Let me take a look. [calls screencapture, receives image, describes what's visible]
 ```
 
 **Platform Support:**
@@ -139,7 +140,9 @@ SCREENSHOTS_DIR=screenshots  # Default: screenshots/
 
 ### MCP Tools (Desktop Automation) ✅ STABLE
 
-**Computer-Control-MCP** provides cross-platform desktop automation capabilities:
+**macOS-Automator-MCP** provides native macOS automation using AppleScript, JXA, and accessibility APIs:
+
+**Migration Note:** This project previously used Computer-Control-MCP (PyAutoGUI-based), which was abandoned due to limitations in image processing and significant latency issues. macOS-Automator-MCP offers superior performance and native macOS integration.
 
 Halfred can control your computer with built-in safety confirmations:
 
@@ -176,7 +179,7 @@ Halfred will:
 - Provides a single `safe_action` tool that simplifies desktop automation
 - Enforces human-in-the-loop confirmation for all state-changing actions
 - Orchestrates the 4-step safety flow automatically (screenshot → highlight → confirm → execute)
-- Routes tool calls to computer-control-mcp or PyAutoGUI fallback
+- Routes tool calls to macos-automator-mcp using AppleScript/JXA execution
 - Cannot be bypassed by the agent (enforced at the code level)
 
 **Architecture:**
@@ -184,10 +187,10 @@ Halfred will:
 Agent calls: safe_action(action_type="click", x=100, y=200, description="Click Safari")
      ↓
 automation_safety.py:
-  1. Takes screenshot via computer-control-mcp
-  2. Shows target region (highlight not supported in computer-control-mcp)
+  1. Takes screenshot via macos-automator-mcp (AppleScript screencapture)
+  2. Shows target region (highlight not yet implemented in macos-automator-mcp)
   3. Requests confirmation via feedback-loop-mcp
-  4. If approved → Executes click_screen via computer-control-mcp
+  4. If approved → Executes action via macos-automator-mcp (AppleScript/cliclick)
      If denied → Returns "Action cancelled by user"
 ```
 
@@ -198,18 +201,18 @@ automation_safety.py:
 - **Reduces errors:** Less cognitive load for the agent means fewer mistakes
 
 **Components:**
-- **computer-control-mcp:** PyAutoGUI-based automation (mouse, keyboard, OCR, screenshots)
+- **macos-automator-mcp:** Native macOS automation using AppleScript/JXA and accessibility APIs
 - **feedback-loop-mcp:** Native macOS overlay for confirmation UI (optional)
 - **automation_safety.py:** Safety wrapper that exposes only the `safe_action` tool
-- **PyAutoGUI:** Direct fallback when computer-control-mcp is unavailable
+- **cliclick:** Command-line tool for precise mouse control (requires: `brew install cliclick`)
 
 **Platform Support:**
-- **All platforms:** computer-control-mcp works on macOS, Windows, and Linux via PyAutoGUI
+- **macOS only:** macos-automator-mcp uses native macOS AppleScript and accessibility APIs
 
 **Configuration:**
 ```bash
 # Enable in .env
-ENABLE_COMPUTER_CONTROL_MCP=false  # Set to true to enable desktop automation
+ENABLE_MACOS_AUTOMATOR_MCP=false  # Set to true to enable desktop automation
 ENABLE_FEEDBACK_LOOP_MCP=false  # Set to true for visual confirmation overlays (macOS only)
 AUTOMATION_REQUIRE_APPROVAL=true  # Safety: always confirm before actions
 DEV_MODE=true  # Recommended for testing automation features
@@ -217,15 +220,18 @@ DEV_MODE=true  # Recommended for testing automation features
 
 **Installation (for automation features):**
 ```bash
-# Install UV (required to run uvx)
-pip install uv
+# Install cliclick (required for mouse control)
+brew install cliclick
 
-# computer-control-mcp will be automatically installed when first run via uvx
-# The first run will download dependencies (~70MB) which may take a moment
+# Ensure Node.js 18+ is installed (required for npx)
+node --version  # Should be 18.0.0 or higher
+# If not installed: brew install node
 
-# On macOS/Linux: Grant permissions in System Settings
-# - Accessibility (for mouse/keyboard control)
-# - Screen Recording (for screenshots)
+# macos-automator-mcp will be automatically installed when first run via npx
+
+# On macOS: Grant permissions in System Settings > Privacy & Security
+# - Accessibility (for UI automation)
+# - Automation (for controlling other applications)
 
 # On Windows: Grant permissions when prompted
 ```
@@ -511,6 +517,38 @@ pip install -e .
 cd ..
 ```
 
+### JSONRPC parsing errors from MCP servers
+
+**Symptoms:** You see errors like:
+```
+Failed to parse JSONRPC message from server
+pydantic_core._pydantic_core.ValidationError: Invalid JSON
+```
+
+**Causes:**
+- **feedback-loop-mcp**: Fixed with `feedback-loop-wrapper.js` (automatically used in `MCP_SERVERS.json`)
+- **macos-automator-mcp**: No known JSONRPC issues
+
+**Status:**
+- ✅ **feedback-loop-mcp errors are FIXED** - The wrapper script eliminates all JSONRPC violations
+- ✅ **macos-automator-mcp is clean** - No protocol violations or spurious logging
+
+**If you still see feedback-loop-mcp errors:**
+1. Verify `MCP_SERVERS.json` uses the wrapper:
+   ```json
+   {
+     "name": "feedback-loop",
+     "params": {
+       "command": "node",
+       "args": ["feedback-loop-wrapper.js"]
+     }
+   }
+   ```
+2. Restart the HALfred application
+3. Check that `node_modules/feedback-loop-mcp/server/mcp-server.js` exists
+
+See `FIXES_CHEAT_SHEET.md` for detailed technical information about these fixes.
+
 ### No audio output
 - Check system audio output settings
 - Verify ElevenLabs API key is valid
@@ -539,12 +577,13 @@ python -c "import sounddevice as sd; print(sd.query_devices())"
 - Ensure OpenAI API key is set in environment
 
 ### Automation features not working
-- Check that `ENABLE_COMPUTER_CONTROL_MCP=true` in `.env`
-- Verify UV is installed: `pip install uv`
-- Run `uvx computer-control-mcp@latest --help` to test installation
-- Check system permissions: Accessibility + Screen Recording (macOS/Linux)
+- Check that `ENABLE_MACOS_AUTOMATOR_MCP=true` in `.env`
+- Verify Node.js 18+ is installed: `node --version`
+- Install cliclick: `brew install cliclick`
+- Verify cliclick installation: `which cliclick` (should show `/opt/homebrew/bin/cliclick`)
+- Check system permissions: System Settings > Privacy & Security > Accessibility + Automation
 - Test with DEV_MODE commands first: `/demo_click`, `/screeninfo`
-- For issues, check MCP server logs or try direct PyAutoGUI: `pip install pyautogui`
+- For issues, check MCP server logs in the terminal output
 
 ### High latency
 - ElevenLabs uses `optimizeStreamingLatency: 3` (max optimization)
@@ -569,9 +608,9 @@ python -c "import sounddevice as sd; print(sd.query_devices())"
 | `PTY_REQUIRE_APPROVAL` | No | `true` | Require user confirmation for risky shell commands |
 | `PTY_SAFE_COMMANDS` | No | See `.env.example` | Comma-separated list of safe commands |
 | `FILESYSTEM_REQUIRE_APPROVAL` | No | `true` | Require user confirmation for risky file operations |
-| `ENABLE_COMPUTER_CONTROL_MCP` | No | `false` | Enable desktop automation features via computer-control-mcp |
+| `ENABLE_MACOS_AUTOMATOR_MCP` | No | `false` | Enable desktop automation features via macos-automator-mcp |
 | `ENABLE_FEEDBACK_LOOP_MCP` | No | `false` | Enable feedback loop confirmation UI (macOS only) |
-| `COMPUTER_CONTROL_MCP_TIMEOUT` | No | `600` | Timeout for automation tool calls (seconds) |
+| `MACOS_AUTOMATOR_MCP_TIMEOUT` | No | `600` | Timeout for automation tool calls (seconds) |
 | `AUTOMATION_REQUIRE_APPROVAL` | No | `true` | Require confirmation for state-changing actions |
 | `PREFERRED_DISPLAY_INDEX` | No | `0` | For dual monitors: which display to use (0=primary) |
 | `DEV_MODE` | No | `false` | Enable developer debug commands |

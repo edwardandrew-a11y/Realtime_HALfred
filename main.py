@@ -52,7 +52,7 @@ from agents.tool import FunctionTool
 from agents.tool_context import ToolContext
 
 # Import automation safety module (local automation_safety.py) when available to expose
-# the safe_action tool and display detection helpers that talk to computer-control/feedback MCP servers.
+# the safe_action tool and display detection helpers that talk to macos-automator/feedback MCP servers.
 try:
     from automation_safety import safe_action, init_display_detection
     AUTOMATION_SAFETY_AVAILABLE = True
@@ -64,12 +64,12 @@ except ImportError as e:
 
 # Import native screenshot tool
 try:
-    from native_screenshot import take_screenshot
+    from native_screenshot import screencapture
     NATIVE_SCREENSHOT_AVAILABLE = True
 except ImportError as e:
     print(f"[native_screenshot] Module not available: {e}")
     NATIVE_SCREENSHOT_AVAILABLE = False
-    take_screenshot = None
+    screencapture = None
 
 # Import MCP schema fix to patch tool schemas for OpenAI Realtime API compatibility
 # This fixes tools like keyboard_type that use union schemas without top-level "type": "object"
@@ -274,8 +274,8 @@ async def init_mcp_servers(stack: AsyncExitStack):
         name = entry.get("name") or entry.get("server_label") or "MCP Server"
 
         # Skip servers based on ENABLE_* environment variables
-        if name == "computer-control" and os.getenv("ENABLE_COMPUTER_CONTROL_MCP", "false").lower() != "true":
-            print(f"[mcp] Skipping {name} (ENABLE_COMPUTER_CONTROL_MCP=false)")
+        if name == "macos-automator" and os.getenv("ENABLE_MACOS_AUTOMATOR_MCP", "false").lower() != "true":
+            print(f"[mcp] Skipping {name} (ENABLE_MACOS_AUTOMATOR_MCP=false)")
             continue
         if name == "feedback-loop" and os.getenv("ENABLE_FEEDBACK_LOOP_MCP", "false").lower() != "true":
             print(f"[mcp] Skipping {name} (ENABLE_FEEDBACK_LOOP_MCP=false)")
@@ -476,6 +476,8 @@ class ElevenLabsTTS:
         self.is_speaking = False
         self._lock = threading.Lock()
         self._speaking_tasks = []  # Track ongoing TTS tasks
+        self._tts_disabled = False  # Flag to disable TTS after fatal errors
+        self._error_notified = False  # Only show error message once
 
     def add_text(self, text: str) -> None:
         # Buffer incoming assistant text and kick off speech tasks for complete sentences.
@@ -513,6 +515,10 @@ class ElevenLabsTTS:
         if not text:
             return
 
+        # Skip TTS if it's been disabled due to previous errors
+        if self._tts_disabled:
+            return
+
         try:
             # Commented out verbose speaking notifications to reduce terminal clutter
             # Uncomment for debugging if needed
@@ -538,9 +544,30 @@ class ElevenLabsTTS:
                         self.player.write(chunk)
 
         except Exception as e:
-            safe_print(f"[elevenlabs] TTS error: {e}")
-            import traceback
-            traceback.print_exc()
+            # Check if this is a payment/auth issue
+            error_str = str(e).lower()
+            is_payment_issue = any(keyword in error_str for keyword in [
+                'payment', 'subscription', 'quota', 'unauthorized', '401', 'invoice'
+            ])
+
+            if is_payment_issue and not self._error_notified:
+                # Show a clear, one-time error message
+                safe_print("\n" + "="*70)
+                safe_print("⚠️  ELEVENLABS TTS DISABLED")
+                safe_print("="*70)
+                safe_print("Reason: Payment or subscription issue detected")
+                safe_print("Impact: Voice output disabled, text-only mode enabled")
+                safe_print("Action: Check your ElevenLabs subscription at https://elevenlabs.io")
+                safe_print("="*70 + "\n")
+                self._error_notified = True
+                self._tts_disabled = True
+            elif not is_payment_issue:
+                # For unexpected errors, show the error but don't spam
+                if not self._error_notified:
+                    safe_print(f"[elevenlabs] TTS error: {e}")
+                    safe_print("[elevenlabs] TTS has been disabled. Check your configuration.")
+                    self._error_notified = True
+                    self._tts_disabled = True
         finally:
             self.is_speaking = False
 
@@ -883,8 +910,16 @@ async def mic_send_loop(session, mic: MicStreamer, listen_state: ListenState):
                     # Safety fallback: don't wait forever
                     elapsed = asyncio.get_event_loop().time() - start_time
                     if elapsed > max_wait_time:
-                        safe_print(f"[mic_send] Timeout waiting for speech_ended ({elapsed:.1f}s), server will auto-commit")
-                        # Mark as committed so we don't try again
+                        safe_print(f"[mic_send] Timeout waiting for speech_ended ({elapsed:.1f}s), forcing commit")
+                        # Force commit the audio buffer since VAD didn't detect speech end
+                        await session.send_audio(b"\x00" * silence_chunk_size, commit=True)
+                        # Wait briefly for the commit to be processed by the server
+                        await asyncio.sleep(0.1)
+                        # Manually trigger response creation since VAD's auto-trigger was bypassed
+                        safe_print(f"[mic_send] Triggering response creation after forced commit")
+                        await session._model.send_event(
+                            RealtimeModelSendRawMessage(message={"type": "response.create"})
+                        )
                         listen_state.turn_state = "committed"
                         listen_state.bytes_appended_since_commit = 0
                         break
@@ -1114,7 +1149,7 @@ async def user_input_loop(session, mic: MicStreamer, player: AudioPlayer, listen
                 continue
 
             if msg.lower().startswith("/screenshot"):
-                # Uses automation_safety.take_screenshot() to capture the screen through computer-control-mcp.
+                # Uses automation_safety.take_screenshot() to capture the screen through macos-automator-mcp.
                 if AUTOMATION_SAFETY_AVAILABLE:
                     from automation_safety import take_screenshot
                     parts = msg.split()
@@ -1126,7 +1161,7 @@ async def user_input_loop(session, mic: MicStreamer, player: AudioPlayer, listen
                 continue
 
             if msg.lower().startswith("/highlight"):
-                # Calls automation_safety.test_highlight() to draw a highlight box via computer-control-mcp.
+                # Calls automation_safety.test_highlight() to draw a highlight box via macos-automator-mcp.
                 if AUTOMATION_SAFETY_AVAILABLE:
                     from automation_safety import test_highlight
                     parts = msg.split()
@@ -1153,7 +1188,7 @@ async def user_input_loop(session, mic: MicStreamer, player: AudioPlayer, listen
                 continue
 
             if msg.lower() == "/demo_click":
-                # Runs a demo click action via automation_safety.demo_safe_click() (computer-control MCP).
+                # Runs a demo click action via automation_safety.demo_safe_click() (macos-automator MCP).
                 if AUTOMATION_SAFETY_AVAILABLE:
                     from automation_safety import demo_safe_click
                     result = await demo_safe_click(mcp_servers)
@@ -1239,7 +1274,7 @@ async def handle_screenshot_image(session, tool_output: str):
 
     Args:
         session: RealtimeSession instance
-        tool_output: JSON string from take_screenshot tool containing path and metadata
+        tool_output: JSON string from screencapture tool containing path and metadata
     """
     try:
         import base64
@@ -1302,7 +1337,7 @@ _original_handle_tool_call = RealtimeSession._handle_tool_call
 
 
 async def _handle_tool_call_with_screenshot(self, event, *, agent_snapshot=None):
-    if event.name != "take_screenshot":
+    if event.name != "screencapture":
         return await _original_handle_tool_call(self, event, agent_snapshot=agent_snapshot)
 
     agent = agent_snapshot or self._current_agent
@@ -1380,7 +1415,7 @@ async def _handle_tool_call_with_screenshot(self, event, *, agent_snapshot=None)
 RealtimeSession._handle_tool_call = _handle_tool_call_with_screenshot  # type: ignore[attr-defined]
 
 
-async def event_loop(session, player: AudioPlayer, mic: MicStreamer, listen_state: ListenState, tts: Optional[ElevenLabsTTS] = None):
+async def event_loop(session, player: AudioPlayer, mic: MicStreamer, listen_state: ListenState, tts: Optional[ElevenLabsTTS] = None, logger: Optional['SessionLogger'] = None):
     # Listens to realtime events from RealtimeRunner/RealtimeAgent (agents/realtime.py)
     # and coordinates mic state, ElevenLabs speech, and logging of MCP tool calls.
     safe_print("[event_loop] Starting event loop...")
@@ -1416,7 +1451,7 @@ async def event_loop(session, player: AudioPlayer, mic: MicStreamer, listen_stat
         elif et == "tool_end":
             safe_print(f"[tool_end] {event.tool.name} output={_truncate(str(event.output))}")
 
-            if event.tool.name == "take_screenshot":
+            if event.tool.name == "screencapture":
                 # Screenshot flow is now handled in the custom tool handler to batch
                 # metadata + image before creating a response.
                 safe_print("[screenshot] Tool end received (batched flow handled upstream)")
@@ -1494,7 +1529,8 @@ async def event_loop(session, player: AudioPlayer, mic: MicStreamer, listen_stat
                     safe_print(f"[speech_ended] VAD detected speech ending")
                     # Signal that speech ended so mic_send_loop knows turn is complete
                     # (The server will auto-commit because create_response: True)
-                    if listen_state.turn_state == "awaiting_speech_end" and listen_state.speech_ended_event:
+                    # Always set the event, even if we're not waiting yet (fixes race condition)
+                    if listen_state.speech_ended_event:
                         listen_state.speech_ended_event.set()
 
                 # Conversation item events
@@ -1551,6 +1587,23 @@ async def main():
     if not os.getenv("ELEVENLABS_API_KEY"):
         raise RuntimeError("ELEVENLABS_API_KEY missing. Put it in your .env")
 
+    # Initialize structured session logger (fail fast if setup fails)
+    from session_logger import SessionLogger
+    try:
+        logger = await SessionLogger.create(
+            logs_dir="./logs",
+            session_metadata={
+                "user_name": os.getenv("USER_NAME", "the user"),
+                "agent_name": "Halfred",
+                "mode": "ptt" if os.getenv("PTT_ENABLED", "false").lower() == "true" else "continuous",
+            },
+            console_output=True
+        )
+    except RuntimeError as e:
+        print(f"\n❌ LOGGING SETUP FAILED\n{e}\n")
+        print("Exiting because logging cannot be initialized.")
+        sys.exit(1)
+
     # Load user personalization (optional)
     user_name = os.getenv("USER_NAME", "the user")
     user_context = os.getenv("USER_CONTEXT", "")
@@ -1560,7 +1613,7 @@ async def main():
     with trace("realtime_halfred", metadata={"app": "Realtime_HALfred", "transport": "websocket"}):
         async with AsyncExitStack() as stack:
             # Bring up any MCP servers described in MCP_SERVERS.json so the agent
-            # can call their tools (computer-control, feedback-loop, filesystem demo, etc.).
+            # can call their tools (macos-automator, feedback-loop, filesystem demo, etc.).
             mcp_servers = await init_mcp_servers(stack)
 
             # Initialize display detection in background (non-blocking, silent on success)
@@ -1656,7 +1709,7 @@ async def main():
                 "- Always explain actions and reasoning for shell commands.\n"
                 "\n"
                 "# Screen Tools\n"
-                "- `take_screenshot`: Capture and see the screen whenever needed (use freely, no approval required).\n"
+                "- `screencapture`: Capture and see the screen whenever needed (use freely, no approval required).\n"
                 "    - Use this tool any time you need visual context about what's on screen.\n"
                 "    - Captures full screen by default, or specific regions if provided.\n"
                 "    - This is your primary way to see what the user sees.\n"
@@ -1664,7 +1717,7 @@ async def main():
                 "    - Returns metadata (path, dimensions) - the image itself is sent separately.\n"
                 "- `analyze_screen`: ONLY use when user explicitly asks you to analyze screen content.\n"
                 "    - This pre-processes the screen through AI and returns text analysis.\n"
-                "    - Not for general use - prefer `take_screenshot` for normal visual inspection.\n"
+                "    - Not for general use - prefer `screencapture` for normal visual inspection.\n"
                 "- `create_stream`, `get_performance_metrics`: for real-time monitoring and system health tracking.\n"
                 "\n"
                 "# Desktop Automation\n"
@@ -1672,6 +1725,22 @@ async def main():
                 "- State-changing actions require on-screen user confirmation.\n"
                 "- Read-only: execute automatically.\n"
                 "- Always brief the user before `safe_action` and confirm results after.\n"
+                "\n"
+                "# Finding Coordinates for UI Elements\n"
+                "When you need to click on UI elements, use this strategy:\n"
+                "\n"
+                "**For TEXT or VISUAL/GRAPHICAL elements (icons, colored buttons, close buttons, graphics):**\n"
+                "1. Use `screencapture` to get a visual snapshot of the screen (the image is sent to you automatically)\n"
+                "2. Analyze the screenshot visually and use the image dimensions returned in the screencapture metadata to identify the element's position\n"
+                "3. Explain your coordinate estimation to the user before clicking\n"
+                "4. If you need window information, use `execute_script` with AppleScript: `tell application \"System Events\" to get name of every process whose background only is false`\n"
+                "5. Note: OCR completely omits small/low-contrast button text - if OCR fails, fall back to visual estimation\n"
+                "\n"
+                "**Example workflows:**\n"
+                "- User: \"Click the Send button\" → Try `take_screenshot_with_ocr` first. If 'Send' not found (OCR omits small/low-contrast text), fall back to visual estimation with `screencapture`\n"
+                "- User: \"Click the Save button\" → Use `screencapture` to visually locate it, then click\n"
+                "- User: \"Click the close/red X/red dot button\" → Skip OCR (it's an icon), go straight to `screencapture` + visual estimation\n"
+                "- User: \"Click the settings gear icon\" → Skip OCR (it's an icon), use `screencapture` + visual estimation\n"
                 "\n"
                 "# Personality & Tone\n"
                 "- Call yourself Halfred, never AI or assistant.\n"
@@ -1695,9 +1764,9 @@ async def main():
             if AUTOMATION_SAFETY_AVAILABLE and safe_action is not None:
                 agent_tools.append(safe_action)
                 print("[automation_safety] safe_action tool registered")
-            if NATIVE_SCREENSHOT_AVAILABLE and take_screenshot is not None:
-                agent_tools.append(take_screenshot)
-                print("[native_screenshot] take_screenshot tool registered")
+            if NATIVE_SCREENSHOT_AVAILABLE and screencapture is not None:
+                agent_tools.append(screencapture)
+                print("[native_screenshot] screencapture tool registered")
 
             # Load push-to-talk configuration (needs to be early to configure turn detection)
             ptt_enabled = os.getenv("PTT_ENABLED", "false").lower() == "true"
@@ -1818,15 +1887,44 @@ async def main():
 
                     # Run console input, event handling, mic streaming, and connection monitoring at the same time.
                     # These tasks all share the session/player/mic/tts objects defined above.
-                    t1 = asyncio.create_task(user_input_loop(session, mic, player, listen_state, mcp_servers, ptt_state, tts))
-                    t2 = asyncio.create_task(event_loop(session, player, mic, listen_state, tts))
-                    t3 = asyncio.create_task(mic_send_loop(session, mic, listen_state))
-                    t4 = asyncio.create_task(connection_health_monitor(listen_state))
-                    t5 = asyncio.create_task(keepalive_loop(session, mic, listen_state))
+                    t1 = asyncio.create_task(user_input_loop(session, mic, player, listen_state, mcp_servers, ptt_state, tts), name="user_input")
+                    t2 = asyncio.create_task(event_loop(session, player, mic, listen_state, tts, logger), name="event_loop")
+                    t3 = asyncio.create_task(mic_send_loop(session, mic, listen_state), name="mic_send")
+                    t4 = asyncio.create_task(connection_health_monitor(listen_state), name="health_monitor")
+                    t5 = asyncio.create_task(keepalive_loop(session, mic, listen_state), name="keepalive")
                     done, pending = await asyncio.wait({t1, t2, t3, t4, t5}, return_when=asyncio.FIRST_COMPLETED)
+
+                    # Diagnose which task completed and why
+                    for task in done:
+                        task_name = task.get_name()
+                        print(f"\n[main] Task '{task_name}' completed, triggering shutdown...")
+
+                        # Check if task raised an exception
+                        try:
+                            exception = task.exception()
+                            if exception:
+                                print(f"[main] ❌ Task '{task_name}' failed with exception:")
+                                import traceback
+                                traceback.print_exception(type(exception), exception, exception.__traceback__)
+                                # Log the exception
+                                await logger.log_error(exception, context=f"main_task_{task_name}")
+                            else:
+                                print(f"[main] Task '{task_name}' completed normally (no exception)")
+                        except asyncio.CancelledError:
+                            print(f"[main] Task '{task_name}' was cancelled")
+                        except Exception as e:
+                            print(f"[main] Could not retrieve exception from task '{task_name}': {e}")
+
+                    # Cancel pending tasks
                     for task in pending:
                         task.cancel()
             finally:
+                # Close logger first to ensure all events are written
+                try:
+                    await logger.close()
+                except Exception as e:
+                    print(f"[session_logger] Error during shutdown: {e}")
+
                 # Ensure hardware resources are released even if tasks error out.
                 if ptt_state.keyboard_listener:
                     ptt_state.keyboard_listener.stop()

@@ -2,14 +2,14 @@
 
 This document describes all tools available to the HALfred agent, organized by source.
 
-**Last Updated:** 2025-12-29
-**Total Tools Available:** 44
+**Last Updated:** 2026-01-03
+**Total Tools Available:** 45
 
 ---
 
 ## Current Configuration
 
-### ✅ **Tools Currently Provided to Agent: 44/44**
+### ✅ **Tools Currently Provided to Agent: 45/45**
 
 All tools from all sources are currently being sent to the OpenAI Realtime API agent.
 
@@ -17,14 +17,15 @@ All tools from all sources are currently being sent to the OpenAI Realtime API a
 - ✅ **Native Python Tools:** 3/3 provided
   - `local_time`
   - `safe_action`
-  - `take_screenshot` (native OS screenshot tool)
+  - `screencapture` (native OS implementation - replaces Computer-Control MCP's version)
 - ✅ **ScreenMonitorMCP Tools:** 26/26 provided
   - All screen analysis, streaming, memory, and system monitoring tools
 - ✅ **PTY Proxy Tools:** 1/1 provided
   - `pty_bash_execute`
-- ✅ **Computer-Control MCP Tools:** 13/13 provided
-  - Mouse, keyboard, window control, and OCR tools (screenshot tools replaced by native implementation)
-  - Requires: `ENABLE_COMPUTER_CONTROL_MCP=true` in `.env`
+- ✅ **macOS-Automator MCP Tools:** 3/3 provided
+  - AppleScript/JXA execution (1 tool), accessibility querying (1 tool), scripting tips (1 tool)
+  - Note: Replaces Computer-Control MCP for better performance and native macOS integration
+  - Requires: `ENABLE_MACOS_AUTOMATOR_MCP=true` in `.env`
 - ✅ **Feedback Loop MCP Tools:** 1/1 provided
   - `feedback_loop`
   - Requires: `ENABLE_FEEDBACK_LOOP_MCP=true` in `.env`
@@ -36,11 +37,11 @@ All tools from all sources are currently being sent to the OpenAI Realtime API a
 | Native Python | ✅ Always On | 3 | None |
 | ScreenMonitorMCP | ✅ Always On | 26 | None |
 | PTY Proxy | ✅ Always On | 1 | None |
-| Computer-Control MCP | ✅ **Enabled** | 13 | `ENABLE_COMPUTER_CONTROL_MCP=true` |
+| macOS-Automator MCP | ✅ **Enabled** | 3 | `ENABLE_MACOS_AUTOMATOR_MCP=true` |
 | Feedback Loop MCP | ✅ **Enabled** | 1 | `ENABLE_FEEDBACK_LOOP_MCP=true` |
 
-**Note:** While all 44 tools are technically available to the agent, usage guidelines in the prompt instruct when each tool should be used. For example:
-- `take_screenshot` - Use freely whenever visual context is needed (native OS implementation)
+**Note:** While all 45 tools are technically available to the agent, usage guidelines in the prompt instruct when each tool should be used. For example:
+- `screencapture` - Use freely whenever visual context is needed (native OS implementation)
 - `analyze_screen` - Only when user explicitly requests screen analysis
 - `safe_action` - For all desktop automation with user confirmation
 
@@ -52,7 +53,7 @@ All tools from all sources are currently being sent to the OpenAI Realtime API a
 - [Native Python Tools](#native-python-tools) (3 tools)
 - [ScreenMonitorMCP Tools](#screenmonitormcp-tools) (26 tools)
 - [PTY Proxy Tools](#pty-proxy-tools) (1 tool)
-- [Computer-Control MCP Tools](#computer-control-mcp-tools) (13 tools)
+- [macOS-Automator MCP Tools](#macos-automator-mcp-tools) (3 tools)
 - [Feedback Loop MCP Tools](#feedback-loop-mcp-tools) (1 tool)
 - [Tool Usage Guidelines](#tool-usage-guidelines)
 
@@ -126,7 +127,7 @@ Execute a desktop automation action with safety confirmation. This tool automati
 
 ---
 
-### 3. `take_screenshot`
+### 3. `screencapture`
 
 **Source:** `native_screenshot.py`
 **Status:** ✅ Always Enabled
@@ -171,9 +172,9 @@ JSON string with screenshot metadata:
 
 **Examples:**
 ```python
-take_screenshot()  # Capture full screen
-take_screenshot(region="100,100,800,600")  # Capture specific region
-take_screenshot(description="Browser window showing error message")
+screencapture()  # Capture full screen
+screencapture(region="100,100,800,600")  # Capture specific region
+screencapture(description="Browser window showing error message")
 ```
 
 ---
@@ -201,7 +202,7 @@ take_screenshot(description="Browser window showing error message")
 
 **When to Use:**
 - ⚠️ **ONLY when user explicitly asks** to analyze screen content
-- Not for general visual inspection - use `screenshot` instead
+- Not for general visual inspection - use `screencapture` instead
 - When you need text-based analysis rather than raw visual data
 
 ---
@@ -551,166 +552,173 @@ take_screenshot(description="Browser window showing error message")
 
 ---
 
-## Computer-Control MCP Tools
+## macOS-Automator MCP Tools
 
-**Source:** `computer-control-mcp` via uvx
-**Status:** ✅ Always Enabled (ENABLE_COMPUTER_CONTROL_MCP=true)
-**Total:** 13 tools
+**Source:** `macos-automator-mcp` via npx
+**Status:** ✅ Enabled (ENABLE_MACOS_AUTOMATOR_MCP=true)
+**Total:** 3 tools
 
-**Note:** The screenshot tools (`take_screenshot`, `take_screenshot_with_ocr`) have been replaced by the native `take_screenshot` tool for better performance and Realtime API integration.
+**Migration Note:** This section replaces Computer-Control MCP Tools. The project migrated from PyAutoGUI-based automation to native macOS AppleScript/JXA for better performance, lower latency, and superior image processing capabilities. See `docs/MACOS_AUTOMATOR_MIGRATION.md` for details.
 
-### Mouse Control Tools (5 tools)
+**Note:** Desktop automation actions are exposed through the `safe_action` wrapper tool which uses macos-automator-mcp internally via AppleScript execution.
 
-#### `click_screen`
+### 1. `execute_script`
 
-**Description:** Click at specified screen coordinates.
-
-**Parameters:**
-- `x` (required, integer): Horizontal screen coordinate (pixels)
-- `y` (required, integer): Vertical screen coordinate (pixels)
-
----
-
-#### `move_mouse`
-
-**Description:** Move mouse cursor to specified coordinates.
+**Description:** Execute AppleScript or JXA (JavaScript for Automation) code on macOS. This is the primary tool for desktop automation, providing access to native macOS scripting capabilities.
 
 **Parameters:**
-- `x` (required, integer): Horizontal screen coordinate (pixels)
-- `y` (required, integer): Vertical screen coordinate (pixels)
+- `input` (required, object): Execution parameters
+  - `script_content` (optional, string): Inline AppleScript/JXA code to execute
+  - `script_path` (optional, string): Path to script file to execute
+  - `kb_script_id` (optional, string): ID of pre-built script from knowledge base (e.g., "safari_get_front_tab_url")
+  - `input_data` (optional, object): Parameters to pass to knowledge base scripts
+  - `language` (optional, string, default: "applescript"): Script language ("applescript" or "javascript")
+  - `timeout_seconds` (optional, integer, default: 60): Execution timeout in seconds
+  - `output_format_mode` (optional, string, default: "auto"): Output format mode
 
----
-
-#### `drag_mouse`
-
-**Description:** Drag mouse from one position to another.
-
-**Parameters:**
-- `from_x` (required, integer): Starting horizontal coordinate
-- `from_y` (required, integer): Starting vertical coordinate
-- `to_x` (required, integer): Ending horizontal coordinate
-- `to_y` (required, integer): Ending vertical coordinate
-- `duration` (optional, number, default: 0.5): Duration of drag in seconds
-
----
-
-#### `mouse_down`
-
-**Description:** Hold down a mouse button.
-
-**Parameters:**
-- `button` (optional, string, default: "left"): Mouse button to press ("left", "right", "middle")
-
----
-
-#### `mouse_up`
-
-**Description:** Release a mouse button.
-
-**Parameters:**
-- `button` (optional, string, default: "left"): Mouse button to release ("left", "right", "middle")
-
----
-
-### Keyboard Control Tools (5 tools)
-
-#### `type_text`
-
-**Description:** Type the specified text at current cursor position.
-
-**Parameters:**
-- `text` (required, string): Literal text to type
-
----
-
-#### `press_key`
-
-**Description:** Press a specified keyboard key.
-
-**Parameters:**
-- `key` (required, string): Key name to press (e.g., "enter", "tab", "escape")
-
----
-
-#### `key_down`
-
-**Description:** Hold down a specific keyboard key until released.
-
-**Parameters:**
-- `key` (required, string): Key name to hold down
-
----
-
-#### `key_up`
-
-**Description:** Release a specific keyboard key.
-
-**Parameters:**
-- `key` (required, string): Key name to release
-
----
-
-#### `press_keys`
-
-**Description:** Press keyboard keys (supports single keys, sequences, and combinations).
-
-**Parameters:**
-- `keys` (required, string or array): Key names to press simultaneously (e.g., "ctrl,c" or ["ctrl", "c"])
+**Returns:** Script execution result as text, JSON, or plist depending on output_format
 
 **Examples:**
-- Single key: `press_keys(keys="enter")`
-- Combination: `press_keys(keys="ctrl,c")` for copy
-- Sequence: `press_keys(keys=["cmd", "shift", "4"])` for screenshot on macOS
+```javascript
+// Get screen size
+execute_script({
+  input: {
+    script_content: `tell application "Finder"
+      set screenBounds to bounds of window of desktop
+      return "width: " & item 3 of screenBounds & ", height: " & item 4 of screenBounds
+    end tell`
+  }
+})
+
+// Click using cliclick
+execute_script({
+  input: {
+    script_content: 'do shell script "/opt/homebrew/bin/cliclick c:100,200"'
+  }
+})
+
+// Type text
+execute_script({
+  input: {
+    script_content: `tell application "System Events"
+      keystroke "Hello World"
+    end tell`
+  }
+})
+
+// Use knowledge base script
+execute_script({
+  input: {
+    kb_script_id: "finder_create_new_folder_desktop",
+    input_data: {"folder_name": "My New Folder"}
+  }
+})
+```
+
+**When to Use:**
+- Directly executing automation actions (via `safe_action` wrapper)
+- Running pre-built automation recipes from knowledge base
+- Custom macOS automation tasks
+- Application-specific automation (Safari, Finder, etc.)
 
 ---
 
-### Screen and Window Management Tools (3 tools)
+### 2. `accessibility_query`
 
-**Note:** Screenshot tools have been moved to native Python tools for better Realtime API integration.
-
-#### `get_screen_size`
-
-**Description:** Get current screen resolution.
-
-**Parameters:** None
-
-**Returns:** Screen width and height
-
----
-
-#### `list_windows`
-
-**Description:** List all open windows.
-
-**Parameters:** None
-
-**Returns:** List of all open windows with titles and properties
-
----
-
-#### `activate_window`
-
-**Description:** Bring specified window to foreground.
+**Description:** Query and interact with macOS UI elements using accessibility APIs. Enables semantic UI automation without pixel-perfect coordinates.
 
 **Parameters:**
-- `title_pattern` (required, string): Window title pattern to activate
-- `use_regex` (optional, boolean, default: false): Use regex for title matching
-- `threshold` (optional, integer, default: 60): Fuzzy match threshold for window title
+- `command` (required, string): Operation to perform ("query", "click", "set_value", etc.)
+- `locator` (required, object): UI element locator
+  - `app` (optional, string): Application name to target
+  - `role` (optional, string): Accessibility role (e.g., "AXButton", "AXTextField", "AXStaticText")
+  - `label` (optional, string): Element label or title
+  - `match` (optional, object): Additional matching criteria
+- `value` (optional, any): Value to set (for set_value command)
+
+**Returns:** Query results or action confirmation
+
+**Examples:**
+```javascript
+// Find all buttons in Safari
+accessibility_query({
+  command: "query",
+  locator: {
+    app: "Safari",
+    role: "AXButton"
+  }
+})
+
+// Click a button by label
+accessibility_query({
+  command: "click",
+  locator: {
+    app: "Safari",
+    role: "AXButton",
+    label: "Go"
+  }
+})
+
+// Find text fields
+accessibility_query({
+  command: "query",
+  locator: {
+    app: "Safari",
+    role: "AXTextField"
+  }
+})
+```
+
+**When to Use:**
+- Finding UI elements without knowing exact coordinates
+- Clicking buttons/links by label instead of position
+- Querying application UI structure
+- More reliable automation across different screen resolutions
 
 ---
 
-### Utility Tool (1 tool)
+### 3. `get_scripting_tips`
 
-#### `wait_milliseconds`
-
-**Description:** Wait for a specified number of milliseconds.
+**Description:** Search through 200+ pre-built automation recipes and get contextual help for macOS automation tasks.
 
 **Parameters:**
-- `milliseconds` (required, integer): Time to wait in milliseconds
+- `query` (optional, string): Search keywords (e.g., "safari", "finder", "screenshot")
+- `category` (optional, string): Filter by category (e.g., "browser", "system", "applications")
+- `limit` (optional, integer, default: 10): Maximum number of results
+
+**Returns:** List of relevant automation recipes with:
+- Script ID (use with `execute_script`)
+- Description
+- Example usage
+- Required parameters
+
+**Examples:**
+```javascript
+// Search for Safari automation
+get_scripting_tips({
+  query: "safari open tab"
+})
+
+// Get Finder scripts
+get_scripting_tips({
+  category: "finder"
+})
+
+// Search for screenshot scripts
+get_scripting_tips({
+  query: "screenshot"
+})
+```
+
+**When to Use:**
+- Discovering automation capabilities
+- Finding pre-built scripts for common tasks
+- Learning automation patterns
+- Getting examples for complex operations
 
 ---
 
-**Note:** Computer-Control-MCP is run via `uvx computer-control-mcp@latest` and provides cross-platform desktop automation using PyAutoGUI, RapidOCR, and ONNXRuntime.
+**Note:** macOS-Automator-MCP provides native macOS automation through AppleScript/JXA and accessibility APIs. For most automation tasks, use the `safe_action` wrapper tool which internally calls `execute_script` with appropriate AppleScript code.
 
 ---
 
@@ -759,14 +767,14 @@ take_screenshot(description="Browser window showing error message")
 
 **No Confirmation Needed:**
 - Read-only operations
-- `screenshot` tool (use freely)
+- `screencapture` tool (use freely)
 - Safe shell commands (pwd, ls, cat, grep, find)
 - Information retrieval
 
 ### Tool Selection Priority
 
 **For Visual Inspection:**
-1. **Primary:** `screenshot` - Use this whenever you need to see the screen
+1. **Primary:** `screencapture` - Use this whenever you need to see the screen
 2. **Secondary:** `analyze_screen` - Only when user explicitly requests analysis
 
 **For Desktop Automation:**
@@ -777,6 +785,50 @@ take_screenshot(description="Browser window showing error message")
 - Use `pty_bash_execute` for all shell operations
 - Safe commands execute automatically
 - Risky commands require user approval
+
+### Coordinate Detection Strategies
+
+When you need to click on UI elements, choose the right approach based on the element type:
+
+**For TEXT elements (buttons with labels, menu items, text in fields):**
+
+1. Use `take_screenshot_with_ocr` to extract text with precise coordinates
+2. Returns `[[4 corners], text, confidence]` tuples with absolute screen coordinates
+3. Use these exact coordinates for pixel-perfect clicking
+4. Processing takes ~20 seconds at 1080p resolution
+5. Best for: labeled buttons, menu items, any text you can click
+
+**For VISUAL/GRAPHICAL elements (icons, colored buttons, close buttons, graphics):**
+
+1. Use `screencapture` to get visual snapshot (image automatically sent to you)
+2. Visually analyze the screenshot to locate the element
+3. Estimate coordinates based on:
+   - Visual position relative to screen edges
+   - Common UI conventions (macOS close buttons at ~70,30-60; Windows close buttons in top-right)
+   - Relative positioning to other visible elements and windows
+4. If you need window information, use `execute_script` with AppleScript:
+   ```applescript
+   tell application "System Events"
+     set appList to name of every process whose background only is false
+   end tell
+   ```
+5. Explain your coordinate estimation reasoning to the user
+6. Important: OCR completely omits small/low-contrast button text - if OCR fails, immediately fall back to visual estimation
+
+**Example Decision Tree:**
+
+- "Click the Send button" → `take_screenshot_with_ocr` (text-based button)
+- "Click the red X close button" → `screencapture` + visual estimation (icon, not text)
+- "Click the gear icon" → `screencapture` + visual estimation (icon, not text)
+- "Click where it says 'Submit'" → `take_screenshot_with_ocr` (looking for specific text)
+- "Click the green checkmark" → `screencapture` + visual estimation (colored icon, not text)
+
+**Common UI Conventions for Estimation:**
+
+- macOS window controls: Top-left at approximately (70, 30-60)
+- Windows window controls: Top-right corner
+- Toolbar icons: Usually evenly spaced in fixed toolbars
+- Menu items: Vertically stacked with consistent spacing
 
 ### Conversation Control Loop
 
@@ -815,5 +867,5 @@ User may interrupt, jump topics, or give commands anytime. Each input restarts t
 
 ---
 
-**Last Updated:** 2025-12-29
-**Agent Version:** HALfred v0.15
+**Last Updated:** 2026-01-03
+**Agent Version:** HALfred v0.16
