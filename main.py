@@ -75,6 +75,18 @@ except ImportError as e:
 # This fixes tools like keyboard_type that use union schemas without top-level "type": "object"
 import mcp_schema_fix  # Applies monkey-patch on import
 
+# Import Supervisor agent for complex task handling
+from supervisor import SupervisorAgent, ContextManager, ConversationContext, SupervisorChunk
+
+# Module-level references for escalation tool (set during initialization)
+_escalation_supervisor: Optional["SupervisorAgent"] = None
+_escalation_context_manager: Optional["ContextManager"] = None
+_escalation_tts: Optional["ElevenLabsTTS"] = None
+_escalation_player: Optional["AudioPlayer"] = None
+_escalation_mic: Optional["MicStreamer"] = None
+_escalation_listen_state: Optional["ListenState"] = None
+_escalation_lock: Optional[asyncio.Lock] = None  # Prevents concurrent escalations
+
 
 # Thread-safe printing that respects the input prompt
 _input_active = threading.Event()
@@ -1004,6 +1016,144 @@ def local_time() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+@function_tool
+async def escalate_to_supervisor(request: str) -> str:
+    """
+    Escalate a task to the Supervisor agent for complex processing.
+
+    Use this tool when you need capabilities beyond simple conversation, including:
+    - Screenshots / seeing the screen / visual context
+    - Web search, current news, real-time information
+    - Code execution, Python computations, data analysis
+    - File search in user's documents (RAG)
+    - Desktop automation (terminal commands, AppleScript, clicking, typing)
+    - Interacting with applications (Anki, browsers, etc.)
+    - Multi-step tasks requiring planning or synthesis
+    - Image generation
+    - Any tool you don't have direct access to
+
+    The Supervisor returns structured JSON with the results. You should parse
+    the JSON and narrate the results to the user in your own voice/personality.
+
+    CRITICAL - Verbatim Rule:
+    Pass the user's EXACT words. Do NOT paraphrase, reformat, or add punctuation.
+    Do NOT add hyphens, quotes, or interpret proper nouns (deck names, file names, etc.).
+    The downstream agents need the user's exact phrasing to do fuzzy matching.
+    Example: User says "Level 2 Prep Emergency Medicine" -> pass exactly that, not "Level 2 Prep - Emergency Medicine"
+
+    Args:
+        request: The user's EXACT transcript/words. Do not paraphrase or reformat.
+
+    Returns:
+        JSON containing success status and supervisor_result (which is also JSON).
+        Parse supervisor_result and narrate the data/summary to the user.
+    """
+    global _escalation_supervisor, _escalation_context_manager, _escalation_tts
+    global _escalation_player, _escalation_mic, _escalation_listen_state, _escalation_lock
+
+    supervisor = _escalation_supervisor
+    context_manager = _escalation_context_manager
+    tts = _escalation_tts
+    mic = _escalation_mic
+    listen_state = _escalation_listen_state
+    lock = _escalation_lock
+
+    if not supervisor or not context_manager:
+        return json.dumps({
+            "success": False,
+            "error": "Supervisor not initialized. Cannot escalate request."
+        })
+
+    # Prevent concurrent escalations - queue them up
+    if lock and lock.locked():
+        safe_print(f"\n[escalation_tool] Waiting for previous escalation to complete...")
+
+    async with lock if lock else asyncio.Lock():
+        safe_print(f"\n[escalation_tool] Routing to Supervisor: {request[:80]}...")
+
+        # Log the escalation call
+        from session_logger import get_global_logger
+        agent_logger = get_global_logger()
+        escalation_start_time = time.time()
+        if agent_logger:
+            await agent_logger.log_agent_call(
+                source_agent="realtime",
+                target_agent="supervisor",
+                request=request,
+                metadata={"user_name": os.getenv("USER_NAME", "User")}
+            )
+
+        # Stop mic during supervisor processing
+        if mic and mic.running:
+            mic.stop(commit=False)
+
+        # Get context from conversation
+        user_name = os.getenv("USER_NAME", "User")
+        context = context_manager.get_context(user_name=user_name)
+
+        accumulated_text = ""
+        success = True
+
+        try:
+            async for chunk in supervisor.process(request, context):
+                if chunk.type == "text_delta":
+                    # Accumulate text (don't stream to TTS - let Realtime agent speak it)
+                    accumulated_text += chunk.content
+                    safe_print(chunk.content, end="", flush=True)
+
+                elif chunk.type == "tool_start":
+                    tool_name = chunk.content
+                    args = chunk.metadata.get("args", {}) if chunk.metadata else {}
+                    safe_print(f"\n[supervisor_tool] Starting: {tool_name}")
+
+                elif chunk.type == "tool_end":
+                    tool_name = chunk.content
+                    tool_success = chunk.metadata.get("success", False) if chunk.metadata else False
+                    status = "✓" if tool_success else "✗"
+                    safe_print(f"[supervisor_tool] {status} Completed: {tool_name}")
+
+                elif chunk.type == "complete":
+                    safe_print("\n[escalation_tool] Supervisor task complete")
+                    # Add to context for future turns
+                    if accumulated_text:
+                        context_manager.add_turn("assistant", accumulated_text)
+                    # Reset clarification count after successful escalation
+                    context_manager.reset_clarification()
+
+                elif chunk.type == "error":
+                    safe_print(f"\n[escalation_tool_error] {chunk.content}")
+                    success = False
+
+        except Exception as e:
+            safe_print(f"\n[escalation_tool_error] Exception: {e}")
+            success = False
+            accumulated_text = f"I encountered an error processing that request: {str(e)[:200]}"
+
+        finally:
+            # Restart mic if in continuous mode
+            if listen_state and mic and listen_state.enabled and not mic.running:
+                safe_print("[mic] Restarting microphone after supervisor response")
+                mic.start()
+
+        # Log the supervisor response
+        escalation_duration_ms = (time.time() - escalation_start_time) * 1000
+        if agent_logger:
+            await agent_logger.log_agent_response(
+                source_agent="supervisor",
+                target_agent="realtime",
+                response=accumulated_text if accumulated_text else '{"status":"error","summary":"No response generated"}',
+                success=success,
+                duration_ms=escalation_duration_ms,
+            )
+
+        # The Supervisor returns JSON data. Pass it through for the Realtime agent to narrate.
+        return json.dumps({
+            "success": success,
+            "supervisor_result": accumulated_text if accumulated_text else '{"status":"error","summary":"No response generated"}',
+            "instructions": "The supervisor_result is JSON. Parse it and narrate the results to the user in your own voice and personality. Focus on the 'summary' and 'data' fields. If status is 'error', explain what went wrong."
+        })
+
+
 async def user_input_loop(session, mic: MicStreamer, player: AudioPlayer, listen_state: ListenState, mcp_servers, ptt_state: PTTState, tts: Optional[ElevenLabsTTS] = None):
     # Handles console input from the user. It controls mic state, lists MCP tools,
     # and exposes DEV_MODE shortcuts that call helpers in automation_safety.py
@@ -1415,7 +1565,93 @@ async def _handle_tool_call_with_screenshot(self, event, *, agent_snapshot=None)
 RealtimeSession._handle_tool_call = _handle_tool_call_with_screenshot  # type: ignore[attr-defined]
 
 
-async def event_loop(session, player: AudioPlayer, mic: MicStreamer, listen_state: ListenState, tts: Optional[ElevenLabsTTS] = None, logger: Optional['SessionLogger'] = None):
+async def handle_supervisor_task(
+    message: str,
+    supervisor: SupervisorAgent,
+    context_manager: ContextManager,
+    tts: Optional[ElevenLabsTTS],
+    player: AudioPlayer,
+    mic: MicStreamer,
+    listen_state: ListenState,
+):
+    """
+    Handle a task routed to the Supervisor agent.
+    Streams supervisor output to TTS for voice response.
+    """
+    safe_print(f"\n[supervisor] Processing: {message[:80]}...")
+
+    # Stop mic during supervisor processing
+    if mic.running:
+        mic.stop(commit=False)
+
+    # Get context from Realtime conversation
+    user_name = os.getenv("USER_NAME", "User")
+    context = context_manager.get_context(user_name=user_name)
+
+    accumulated_text = ""
+
+    try:
+        async for chunk in supervisor.process(message, context):
+            if chunk.type == "text_delta":
+                # Stream text to console and TTS
+                accumulated_text += chunk.content
+                safe_print(chunk.content, end="", flush=True)
+                if tts and chunk.content:
+                    tts.add_text(chunk.content)
+
+            elif chunk.type == "tool_start":
+                tool_name = chunk.content
+                args = chunk.metadata.get("args", {}) if chunk.metadata else {}
+                safe_print(f"\n[supervisor_tool] Starting: {tool_name} args={_truncate(str(args))}")
+
+            elif chunk.type == "tool_end":
+                tool_name = chunk.content
+                success = chunk.metadata.get("success", False) if chunk.metadata else False
+                status = "✓" if success else "✗"
+                safe_print(f"[supervisor_tool] {status} Completed: {tool_name}")
+
+            elif chunk.type == "reasoning":
+                safe_print(f"\n[reasoning] {chunk.content[:200]}...")
+
+            elif chunk.type == "complete":
+                safe_print("\n[supervisor] Task complete")
+                # Add to context for future turns
+                if accumulated_text:
+                    context_manager.add_turn("assistant", accumulated_text)
+                # Reset clarification count after successful escalation
+                context_manager.reset_clarification()
+
+            elif chunk.type == "error":
+                safe_print(f"\n[supervisor_error] {chunk.content}")
+
+        # Flush TTS after processing
+        if tts:
+            await tts.flush()
+
+    except Exception as e:
+        safe_print(f"\n[supervisor_error] Exception: {e}")
+        if tts:
+            tts.add_text(f"I encountered an error processing that request: {str(e)[:100]}")
+            await tts.flush()
+
+    finally:
+        # Reset turn state and restart mic if in continuous mode
+        listen_state.turn_state = "idle"
+        if listen_state.enabled and not mic.running:
+            safe_print("[mic] Restarting microphone after supervisor response")
+            mic.start()
+
+
+async def event_loop(
+    session,
+    player: AudioPlayer,
+    mic: MicStreamer,
+    listen_state: ListenState,
+    tts: Optional[ElevenLabsTTS] = None,
+    logger: Optional['SessionLogger'] = None,
+    supervisor: Optional[SupervisorAgent] = None,
+    context_manager: Optional[ContextManager] = None,
+):
     # Listens to realtime events from RealtimeRunner/RealtimeAgent (agents/realtime.py)
     # and coordinates mic state, ElevenLabs speech, and logging of MCP tool calls.
     safe_print("[event_loop] Starting event loop...")
@@ -1509,10 +1745,14 @@ async def event_loop(session, player: AudioPlayer, mic: MicStreamer, listen_stat
                     if tts:
                         await tts.flush()
 
-                # Log transcription events to debug audio processing
+                # Log transcription events and check for supervisor escalation
                 elif t == "conversation.item.input_audio_transcription.completed":
                     transcript = raw_evt.get("transcript", "")
                     safe_print(f"[transcription] \"{transcript}\"")
+
+                    # Track conversation context (escalation now handled via tool call)
+                    if context_manager and transcript.strip():
+                        context_manager.add_turn("user", transcript)
                 elif t == "conversation.item.input_audio_transcription.failed":
                     safe_print(f"[transcription_failed] {raw_evt.get('error', 'Unknown error')}")
 
@@ -1588,7 +1828,7 @@ async def main():
         raise RuntimeError("ELEVENLABS_API_KEY missing. Put it in your .env")
 
     # Initialize structured session logger (fail fast if setup fails)
-    from session_logger import SessionLogger
+    from session_logger import SessionLogger, set_global_logger
     try:
         logger = await SessionLogger.create(
             logs_dir="./logs",
@@ -1599,6 +1839,8 @@ async def main():
             },
             console_output=True
         )
+        # Set global logger for cross-module access (supervisor, anki_agent, etc.)
+        set_global_logger(logger)
     except RuntimeError as e:
         print(f"\n❌ LOGGING SETUP FAILED\n{e}\n")
         print("Exiting because logging cannot be initialized.")
@@ -1693,54 +1935,9 @@ async def main():
                 "- Narrate tool usage in one line only; no detailed play-by-play.\n"
                 "- After tool use, give a brief result and next step.\n"
                 "- If tool output fails, state what happened, retry or ask for clarification.\n"
-                "- Ask for user confirmation before risky/irreversible actions (e.g., deleting, submitting, purchases).\n"
+                "- Ask for user confirmation before risky/irreversible actions.\n"
                 "- If the user interrupts while a tool is running, stop, acknowledge the interruption, and re-evaluate the new intent before continuing.\n"
                 "- For confirmation: single yes/no question, then wait.\n"
-                "- Prefer read-only before make changes.\n"
-                "- For desktop automation:\n"
-                "    1. State intended outcome, not clicks.\n"
-                "    2. Confirm for high-impact.\n"
-                "    3. Verify outcome with screen feedback.\n"
-                "- Use and verify MCP tools appropriately.\n"
-                "\n"
-                "# PTY Terminal\n"
-                "- Use `pty_bash_execute` for file and system inspection (safe: `pwd`, `ls`, `cat`, etc.).\n"
-                "- Risky commands (e.g., `rm`, `chmod`, network) require user approval.\n"
-                "- Always explain actions and reasoning for shell commands.\n"
-                "\n"
-                "# Screen Tools\n"
-                "- `screencapture`: Capture and see the screen whenever needed (use freely, no approval required).\n"
-                "    - Use this tool any time you need visual context about what's on screen.\n"
-                "    - Captures full screen by default, or specific regions if provided.\n"
-                "    - This is your primary way to see what the user sees.\n"
-                "    - The screenshot is automatically sent to you as an image so you can see it.\n"
-                "    - Returns metadata (path, dimensions) - the image itself is sent separately.\n"
-                "- `analyze_screen`: ONLY use when user explicitly asks you to analyze screen content.\n"
-                "    - This pre-processes the screen through AI and returns text analysis.\n"
-                "    - Not for general use - prefer `screencapture` for normal visual inspection.\n"
-                "- `create_stream`, `get_performance_metrics`: for real-time monitoring and system health tracking.\n"
-                "\n"
-                "# Desktop Automation\n"
-                "- Use `safe_action` for desktop control (click, double-click, type, hotkey, window_control).\n"
-                "- State-changing actions require on-screen user confirmation.\n"
-                "- Read-only: execute automatically.\n"
-                "- Always brief the user before `safe_action` and confirm results after.\n"
-                "\n"
-                "# Finding Coordinates for UI Elements\n"
-                "When you need to click on UI elements, use this strategy:\n"
-                "\n"
-                "**For TEXT or VISUAL/GRAPHICAL elements (icons, colored buttons, close buttons, graphics):**\n"
-                "1. Use `screencapture` to get a visual snapshot of the screen (the image is sent to you automatically)\n"
-                "2. Analyze the screenshot visually and use the image dimensions returned in the screencapture metadata to identify the element's position\n"
-                "3. Explain your coordinate estimation to the user before clicking\n"
-                "4. If you need window information, use `execute_script` with AppleScript: `tell application \"System Events\" to get name of every process whose background only is false`\n"
-                "5. Note: OCR completely omits small/low-contrast button text - if OCR fails, fall back to visual estimation\n"
-                "\n"
-                "**Example workflows:**\n"
-                "- User: \"Click the Send button\" → Try `take_screenshot_with_ocr` first. If 'Send' not found (OCR omits small/low-contrast text), fall back to visual estimation with `screencapture`\n"
-                "- User: \"Click the Save button\" → Use `screencapture` to visually locate it, then click\n"
-                "- User: \"Click the close/red X/red dot button\" → Skip OCR (it's an icon), go straight to `screencapture` + visual estimation\n"
-                "- User: \"Click the settings gear icon\" → Skip OCR (it's an icon), use `screencapture` + visual estimation\n"
                 "\n"
                 "# Personality & Tone\n"
                 "- Call yourself Halfred, never AI or assistant.\n"
@@ -1756,30 +1953,72 @@ async def main():
                 "# Vibe\n"
                 "You're Halfred: sardonic, sharp, hiding warmth behind dark humor, med-school trauma, and questionable choices.\n"
                 "\n"
+                "# Your Role: Front Desk\n"
+                "You are the 'front desk' - fast, conversational, minimal reasoning, minimal risk.\n"
+                "\n"
+                "## Your Tool\n"
+                "- `escalate_to_supervisor`: Pass tasks to the Supervisor agent who has all the tools (screenshots, web search, code, desktop automation, etc.)\n"
+                "\n"
+                "## Handle Locally:\n"
+                "- Simple Q&A, definitions, short explanations (no external data needed)\n"
+                "- One clarifying question to understand vague requests (max 1 before escalating)\n"
+                "- UI glue: restate requests, confirm intent, summarize what happens next\n"
+                "- General conversation, banter, jokes\n"
+                "\n"
+                "## Use escalate_to_supervisor when ANY is true:\n"
+                "- You need to see the screen (screenshots) or user wants you to look at something\n"
+                "- User needs web search, code execution, file search, terminal commands, or desktop automation\n"
+                "- Task requires interacting with applications (Anki, browsers, etc.)\n"
+                "- Task requires multi-step planning, comparison, or synthesis\n"
+                "- User wants to search documents, find files, or do RAG retrieval\n"
+                "- High-stakes or irreversible actions (send, delete, purchase, deploy, permissions)\n"
+                "- Ambiguity remains after 1 clarifying question\n"
+                "\n"
+                "## How to Escalate - CRITICAL\n"
+                "Call `escalate_to_supervisor` with the user's EXACT words.\n"
+                "DO NOT paraphrase, reformat, or add punctuation to proper nouns.\n"
+                "Pass names, deck names, file names, etc. EXACTLY as the user said them.\n"
+                "Example: User says 'Level 2 Prep Emergency Medicine' -> pass exactly that, NOT 'Level 2 Prep - Emergency Medicine'\n"
+                "The downstream agents do fuzzy matching - they need the original phrasing.\n"
+                "The response is streamed to TTS automatically, so briefly acknowledge completion.\n"
+                "\n"
             )
 
-            # Build tools list - add local Python tools (local_time) and, if available,
-            # the safe_action tool from automation_safety.py so the agent can drive MCP automation safely.
-            agent_tools = [local_time]
+            # Build supervisor tools list - ALL tools go to Supervisor
+            supervisor_native_tools = [local_time]
             if AUTOMATION_SAFETY_AVAILABLE and safe_action is not None:
-                agent_tools.append(safe_action)
-                print("[automation_safety] safe_action tool registered")
+                supervisor_native_tools.append(safe_action)
+                print("[supervisor] safe_action tool registered")
             if NATIVE_SCREENSHOT_AVAILABLE and screencapture is not None:
-                agent_tools.append(screencapture)
-                print("[native_screenshot] screencapture tool registered")
+                supervisor_native_tools.append(screencapture)
+                print("[supervisor] screencapture tool registered")
+
+            # Initialize Supervisor agent with ALL tools and MCP servers
+            supervisor = SupervisorAgent(
+                mcp_servers=mcp_servers,
+                native_tools=supervisor_native_tools,
+                # model and vector_store_id loaded from env vars
+            )
+            context_manager = ContextManager(max_turns=10, summarize_threshold=20)
+            print(f"[supervisor] Initialized with model: {supervisor.model}")
+
+            # Realtime agent only gets escalation tool - all other tools are on Supervisor
+            # The agent uses its own reasoning to decide when to escalate
+            agent_tools = [escalate_to_supervisor]
+            print("[realtime] escalate_to_supervisor tool registered (only tool for Realtime agent)")
 
             # Load push-to-talk configuration (needs to be early to configure turn detection)
             ptt_enabled = os.getenv("PTT_ENABLED", "false").lower() == "true"
             ptt_key = os.getenv("PTT_KEY", "cmd_alt")
             ptt_interrupts = os.getenv("PTT_INTERRUPTS_SPEECH", "true").lower() == "true"
 
-            # Create the OpenAI RealtimeAgent (agents/realtime.py) with our persona,
-            # tool list, and MCP servers to delegate tool calls.
+            # Create the OpenAI RealtimeAgent (agents/realtime.py) with minimal tools
+            # All MCP servers moved to Supervisor - Realtime is the "front desk"
             agent = RealtimeAgent(
                 name="Halfred",
                 instructions=instructions,
                 tools=agent_tools,
-                mcp_servers=mcp_servers,
+                mcp_servers=[],  # All MCPs handled by Supervisor now
             )
 
             # RealtimeRunner (agents/realtime.py) maintains the websocket connection to
@@ -1836,6 +2075,19 @@ async def main():
             )
             listen_state = ListenState(speech_ended_event=asyncio.Event())
 
+            # Set module-level references for the escalation tool
+            # These allow escalate_to_supervisor to access runtime components
+            global _escalation_supervisor, _escalation_context_manager, _escalation_tts
+            global _escalation_player, _escalation_mic, _escalation_listen_state, _escalation_lock
+            _escalation_supervisor = supervisor
+            _escalation_context_manager = context_manager
+            _escalation_tts = tts
+            _escalation_player = player
+            _escalation_mic = mic
+            _escalation_listen_state = listen_state
+            _escalation_lock = asyncio.Lock()  # Prevents concurrent escalations
+            print("[escalation] Module-level references set for escalation tool")
+
             # Load push-to-talk configuration
             ptt_enabled = os.getenv("PTT_ENABLED", "false").lower() == "true"
             ptt_key = os.getenv("PTT_KEY", "cmd_alt")
@@ -1888,7 +2140,7 @@ async def main():
                     # Run console input, event handling, mic streaming, and connection monitoring at the same time.
                     # These tasks all share the session/player/mic/tts objects defined above.
                     t1 = asyncio.create_task(user_input_loop(session, mic, player, listen_state, mcp_servers, ptt_state, tts), name="user_input")
-                    t2 = asyncio.create_task(event_loop(session, player, mic, listen_state, tts, logger), name="event_loop")
+                    t2 = asyncio.create_task(event_loop(session, player, mic, listen_state, tts, logger, supervisor, context_manager), name="event_loop")
                     t3 = asyncio.create_task(mic_send_loop(session, mic, listen_state), name="mic_send")
                     t4 = asyncio.create_task(connection_health_monitor(listen_state), name="health_monitor")
                     t5 = asyncio.create_task(keepalive_loop(session, mic, listen_state), name="keepalive")

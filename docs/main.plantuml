@@ -1,0 +1,95 @@
+@startuml
+
+!theme plain
+top to bottom direction
+skinparam linetype ortho
+
+class node2 as "main.AudioPlayer" {
+   channels: 
+   _last_write_ts: 
+   _lock: 
+   _buf: 
+   dtype: 
+   _stream: 
+   samplerate: 
+   __init__(self, samplerate: int = 24000, channels: int = 1, dtype: str = "int16"): 
+   start(self): 
+   stop(self): 
+   clear(self): 
+   write(self, pcm_bytes: bytes): 
+   is_playing(self, hangover_s: float = 0.25): 
+   _callback(self, outdata, frames, time, status): 
+}
+class node4 as "main.ElevenLabsTTS" {
+   text_buffer: 
+   is_speaking: 
+   voice_id: 
+   _lock: 
+   client: 
+   model_id: 
+   _speaking_tasks: 
+   player: 
+   __init__(self, api_key: str, player: AudioPlayer, voice_id: str = "21m00Tcm4TlvDq8ikWAM"): 
+   add_text(self, text: str): 
+   _speak_async(self, text: str): 
+   flush(self): 
+   interrupt(self): 
+}
+class node0 as "main.KeyboardListener" {
+   _modifiers_held: 
+   _listener: 
+   _target_key: 
+   _on_press_callback: 
+   _required_modifiers: 
+   _is_combination: 
+   _on_release_callback: 
+   is_pressed: 
+   ptt_key: 
+   __init__(self, ptt_key: str = "space", on_press_callback=None, on_release_callback=None): 
+   _parse_combination(self, combo: str): 
+   _parse_key(self, key_name: str): 
+   _check_combination_active(self): 
+   _matches_target(self, key): 
+   _on_press(self, key): 
+   _on_release(self, key): 
+   start(self): 
+   stop(self): 
+}
+class node1 as "main.ListenState" {
+   enabled: 
+   ptt_mode: 
+   ptt_active: 
+   ptt_interrupts: 
+}
+class node3 as "main.MicStreamer" {
+   channels: 
+   loop: 
+   dtype: 
+   _stream: 
+   _running: 
+   queue: 
+   mute_fn: 
+   samplerate: 
+   __init__(
+        self,
+        *,
+        loop: asyncio.AbstractEventLoop,
+        samplerate: int = 24000,
+        channels: int = 1,
+        dtype: str = "int16",
+        mute_fn: Optional[Callable[[], bool]] = None,
+    ): 
+   running(self): 
+   start(self): 
+   stop(self, *, commit: bool = True): 
+   close(self): 
+   _callback(self, indata, frames, time, status): 
+}
+class node5 as "main.PTTState" {
+   keyboard_listener: 
+   on_press_callback: 
+   on_release_callback: 
+   ptt_key: 
+}
+
+@enduml

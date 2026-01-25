@@ -1,3 +1,4 @@
+requests
 # ========================================
 # Realtime HALfred - Core Dependencies
 # ========================================
@@ -21,6 +22,9 @@ pynput>=1.7.6
 
 # OpenAI Agents SDK (Realtime API + MCP support)
 openai-agents>=0.6.0
+
+# OpenAI Python SDK (Responses API used by Supervisor/Anki subagent)
+openai>=1.0.0
 
 # MCP (Model Context Protocol) server support
 mcp>=1.0.0

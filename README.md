@@ -2,12 +2,22 @@
 
 A Python-based realtime voice assistant powered by OpenAI's Realtime API and ElevenLabs TTS. HALfred is a sardonic, sharp-tongued AI companion with personality, capable of natural voice conversations and equipped with screen monitoring capabilities through MCP integration.
 
-> **Recent Updates:** Tool schemas have been improved with proper type enforcement, enum constraints, and conditional validation. See [TOOLS.md](TOOLS.md) for complete documentation.
+> **Recent Updates:** v0.18 introduces a hierarchical agent architecture with a Supervisor agent for complex tasks. See [docs/SUPERVISOR.md](docs/SUPERVISOR.md) for details.
+
+## Complete environment setup:
+git clone --recursive https://github.com/edwardandrew-a11y/Realtime_HALfred.git                                                            
+python -m venv .venv                                                                      
+source .venv/bin/activate                                                                 
+pip install -r requirements.txt                                                           
+cd ScreenMonitorMCP && pip install -e . && cd ..                                          
+npm install
+
 
 ## Overview
 
 Realtime HALfred uses:
 - **OpenAI Realtime API** (`gpt-realtime`) for low-latency voice interactions with native STT
+- **OpenAI Responses API** (Supervisor) for complex tasks with built-in tools (web search, code interpreter, image generation, file search)
 - **ElevenLabs** for high-quality, natural text-to-speech output
 - **ScreenMonitorMCP** for AI vision and screen analysis capabilities
 - **PTY Terminal Access** for safe shell command execution with user confirmation
@@ -456,33 +466,58 @@ When push-to-talk is enabled:
 
 ## Architecture
 
+HALfred uses a **two-tier agent architecture**:
+
+1. **Realtime Agent** - "Front desk" for fast, conversational interactions (screencapture only)
+2. **Supervisor Agent** - Handles complex tasks with full tool access
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                      Realtime HALfred                        │
 └─────────────────────────────────────────────────────────────┘
                               │
-        ┌─────────────────────┼─────────────────────┐
-        ▼                     ▼                     ▼
-┌──────────────┐    ┌──────────────────┐    ┌────────────┐
-│   OpenAI     │    │   ElevenLabs     │    │    MCP     │
-│  Realtime    │    │      TTS         │    │  Servers   │
-│  (STT+LLM)   │    │   (Streaming)    │    │            │
-└──────────────┘    └──────────────────┘    └────────────┘
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌──────────────┐    ┌──────────────────┐    ┌────────────┐
-│   Optional   │    │   AudioPlayer    │    │  Screen    │
-│   Whisper    │    │  (sounddevice)   │    │  Monitor   │
-│  Transcript  │    │                  │    │            │
-└──────────────┘    └──────────────────┘    └────────────┘
-        │                     │
-        └──────────┬──────────┘
-                   ▼
-            ┌─────────────┐
-            │ MicStreamer │
-            │(sounddevice)│
-            └─────────────┘
+                    ┌─────────┴─────────┐
+                    ▼                   ▼
+           ┌──────────────┐    ┌──────────────────┐
+           │   OpenAI     │    │   Supervisor     │
+           │  Realtime    │    │   (Responses)    │
+           │  "Front Desk"│    │   Complex Tasks  │
+           │  - Voice I/O │    │   - Web Search   │
+           │  - Screenshot│    │   - Code Interp  │
+           │  - Simple Q&A│    │   - Image Gen    │
+           └──────────────┘    │   - File Search  │
+                    │          │   - MCP Tools    │
+                    │          │   - Automation   │
+                    │          └──────────────────┘
+                    │                   │
+        ┌───────────┼───────────┐       │
+        ▼           ▼           ▼       ▼
+┌────────────┐ ┌──────────┐ ┌──────────────────┐
+│ ElevenLabs │ │  Audio   │ │   MCP Servers    │
+│    TTS     │ │  Player  │ │ (screen, pty,    │
+│            │ │          │ │  automator)      │
+└────────────┘ └──────────┘ └──────────────────┘
+        │           │
+        └─────┬─────┘
+              ▼
+       ┌─────────────┐
+       │ MicStreamer │
+       │(sounddevice)│
+       └─────────────┘
 ```
+
+### Routing Logic
+
+| User Request | Handled By | Reason |
+|--------------|------------|--------|
+| "Tell me a joke" | Realtime | Simple conversation |
+| "What time is it?" | Realtime | Basic Q&A |
+| "Search for AI news" | Supervisor | Requires web_search |
+| "Write Python code" | Supervisor | Requires code_interpreter |
+| "Generate an image" | Supervisor | Requires image_generation |
+| "Run a terminal command" | Supervisor | Requires MCP tools |
+
+See [docs/SUPERVISOR.md](docs/SUPERVISOR.md) for detailed architecture documentation.
 
 ## Audio Configuration
 
@@ -614,12 +649,15 @@ python -c "import sounddevice as sd; print(sd.query_devices())"
 | `AUTOMATION_REQUIRE_APPROVAL` | No | `true` | Require confirmation for state-changing actions |
 | `PREFERRED_DISPLAY_INDEX` | No | `0` | For dual monitors: which display to use (0=primary) |
 | `DEV_MODE` | No | `false` | Enable developer debug commands |
+| `SUPERVISOR_MODEL` | No | `gpt-4.1` | Model for Supervisor agent (Responses API) |
+| `SUPERVISOR_VECTOR_STORE_ID` | No | - | Vector store ID for file_search RAG capability |
 
 ## Project Structure
 
 ```
 Realtime_HALfred/
-├── main.py                     # Main application entry point
+├── main.py                     # Main application entry point (Realtime agent)
+├── supervisor.py               # Supervisor agent (Responses API for complex tasks)
 ├── MCP_SERVERS.json            # MCP server configuration (uses relative paths)
 ├── MCP_SERVERS.json.example    # Example MCP configuration
 ├── .env                        # Environment variables (API keys) - create from .env.example
@@ -637,7 +675,8 @@ Realtime_HALfred/
 ├── README.md                   # This file
 ├── docs/
 │   ├── AUTOMATION.md           # Desktop automation user guide
-│   └── AUTOMATION_IMPLEMENTATION.md  # Technical implementation details
+│   ├── AUTOMATION_IMPLEMENTATION.md  # Technical implementation details
+│   └── SUPERVISOR.md           # Supervisor agent architecture documentation
 ├── ScreenMonitorMCP/           # Screen monitoring MCP server (git submodule)
 ├── data/                       # Data directory (logs, SQLite memory DB)
 ├── node_modules/               # Node.js packages (feedback-loop-mcp)
