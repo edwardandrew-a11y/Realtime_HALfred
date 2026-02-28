@@ -111,9 +111,14 @@ async def execute_applescript(script: str, mcp_servers: List[Any]) -> str:
         result = await call_mcp_tool(
             "macos-automator",
             "execute_script",
-            {"input": {"script_content": script}},
+            {"script_content": script},
             mcp_servers
         )
+
+        # Check for MCP-level error flag
+        if getattr(result, 'isError', False):
+            text = result.content[0].text if hasattr(result, 'content') and result.content else str(result)
+            raise Exception(f"Script execution failed. Details: {text}")
 
         if hasattr(result, 'content') and result.content:
             return result.content[0].text
@@ -485,19 +490,48 @@ end tell
                         modifiers.append('shift')
 
                 modifier_str = ' using {' + ', '.join([f'{m} down' for m in modifiers]) + '}' if modifiers else ''
-                script = f'''
+
+                # macOS key codes for non-character keys (more reliable than unquoted constants)
+                special_key_codes = {
+                    'return': 36, 'enter': 36,
+                    'tab': 48,
+                    'space': 49,
+                    'delete': 51, 'backspace': 51, 'del': 51,
+                    'forward_delete': 117, 'forwarddelete': 117,
+                    'escape': 53, 'esc': 53,
+                    'left': 123, 'arrow_left': 123,
+                    'right': 124, 'arrow_right': 124,
+                    'down': 125, 'arrow_down': 125,
+                    'up': 126, 'arrow_up': 126,
+                    'home': 115, 'end': 119,
+                    'pageup': 116, 'pgup': 116, 'page_up': 116, 'page-up': 116,
+                    'pagedown': 121, 'pgdn': 121, 'page_down': 121, 'page-down': 121,
+                    'f1': 122, 'f2': 120, 'f3': 99, 'f4': 118,
+                    'f5': 96, 'f6': 97, 'f7': 98, 'f8': 100,
+                    'f9': 101, 'f10': 109, 'f11': 103, 'f12': 111,
+                }
+
+                if key in special_key_codes:
+                    script = f'''
+tell application "System Events"
+    key code {special_key_codes[key]}{modifier_str}
+end tell
+'''
+                elif len(key) == 1:
+                    script = f'''
 tell application "System Events"
     keystroke "{key}"{modifier_str}
 end tell
 '''
+                else:
+                    return f"Error: unknown key '{key}' — expected a single character or special key name (return, tab, escape, delete, arrow_left, etc.)"
 
             elif action_type.lower() == "window_control":
                 if not window_title:
                     return "Error: 'window_title' parameter required for window_control action"
+                # "activate" both launches (if needed) and brings to front
                 script = f'''
-tell application "System Events"
-    set frontmost of first application process whose name contains "{window_title}" to true
-end tell
+tell application "{window_title}" to activate
 '''
 
             # Execute the AppleScript

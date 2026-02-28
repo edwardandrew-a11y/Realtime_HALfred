@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, AsyncGenerator, Dict, List, Literal, Optional
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 from agents.tool import FunctionTool
 from anki_agent import AnkiSubagent
@@ -90,7 +90,7 @@ class ContextManager:
         self.summarize_model = summarize_model
         self.summary: Optional[str] = None
         self.session_start = datetime.now()
-        self.client = OpenAI()
+        self.client = AsyncOpenAI()
         self._summarizing = False
         self.clarification_count = 0  # Track clarifications for escalation
 
@@ -138,7 +138,7 @@ Conversation:
 
 Summary (2-3 sentences):"""
 
-            response = self.client.responses.create(
+            response = await self.client.responses.create(
                 model=self.summarize_model,
                 input=[{"role": "user", "content": prompt}],
             )
@@ -296,7 +296,7 @@ Examples:
         vector_store_id: Optional[str] = None,
         enable_anki: bool = True,
     ):
-        self.client = OpenAI()
+        self.client = AsyncOpenAI()
         self.mcp_servers = mcp_servers or []
         self.native_tools = list(native_tools) if native_tools else []
         self.model = model or os.getenv("SUPERVISOR_MODEL", "gpt-4.1")
@@ -412,19 +412,27 @@ Examples:
                 server = self._find_mcp_server(server_name)
                 if server:
                     result = await server.call_tool(mcp_tool_name, args)
+                    # Extract text from CallToolResult (MCP returns Pydantic objects, not dicts)
+                    if hasattr(result, 'content') and result.content:
+                        text_parts = [c.text for c in result.content if hasattr(c, 'text')]
+                        result_text = "\n".join(text_parts) if text_parts else str(result)
+                    else:
+                        result_text = str(result)
+                    is_error = getattr(result, 'isError', False)
+                    if is_error:
+                        raise ValueError(f"MCP tool error: {result_text}")
                     # Log the response
                     duration_ms = (time.time() - start_time) * 1000
                     if logger:
-                        result_str = json.dumps(result) if not isinstance(result, str) else result
                         await logger.log_agent_response(
                             source_agent=tool_name,
                             target_agent="supervisor",
-                            response=result_str,
+                            response=result_text,
                             success=True,
                             duration_ms=duration_ms,
                             metadata={"tool_type": "mcp"}
                         )
-                    return result
+                    return result_text
                 raise ValueError(f"MCP server '{server_name}' not found")
 
             # Check if it's a native tool
@@ -512,9 +520,9 @@ Examples:
                 current_round += 1
                 print(f"[supervisor_debug] === Round {current_round} ===")
 
-                # Create streaming response
+                # Create streaming response (async to avoid blocking the event loop)
                 if is_initial:
-                    response = self.client.responses.create(
+                    response = await self.client.responses.create(
                         model=self.model,
                         input=next_input,
                         tools=tools,
@@ -526,7 +534,7 @@ Examples:
                     is_initial = False
                 else:
                     # Continuation with tool outputs
-                    response = self.client.responses.create(
+                    response = await self.client.responses.create(
                         model=self.model,
                         previous_response_id=current_response_id,
                         input=next_input,
@@ -540,8 +548,8 @@ Examples:
                 function_call_items = {}  # item_id -> {name, call_id}
                 got_text_output = False
 
-                # Process streaming events
-                for event in response:
+                # Process streaming events (async iteration keeps event loop free)
+                async for event in response:
                     event_type = getattr(event, 'type', None)
 
                     # Debug: print events (skip noisy delta events)

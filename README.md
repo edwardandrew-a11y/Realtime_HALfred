@@ -676,6 +676,7 @@ Realtime_HALfred/
 ├── docs/
 │   ├── AUTOMATION.md           # Desktop automation user guide
 │   ├── AUTOMATION_IMPLEMENTATION.md  # Technical implementation details
+│   ├── KNOWN_ISSUES.md         # Known issues and deferred fixes
 │   └── SUPERVISOR.md           # Supervisor agent architecture documentation
 ├── ScreenMonitorMCP/           # Screen monitoring MCP server (git submodule)
 ├── data/                       # Data directory (logs, SQLite memory DB)

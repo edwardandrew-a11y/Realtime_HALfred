@@ -340,14 +340,13 @@ See [Anki Subagent Tools](#anki-subagent-tools) for the 14 internal tools.
 
 **Description:** Execute AppleScript or JXA (JavaScript for Automation) code on macOS.
 
-**Parameters:**
-- `input` (required, object):
-  - `script_content` (optional, string): Inline AppleScript/JXA code
-  - `script_path` (optional, string): Path to script file
-  - `kb_script_id` (optional, string): ID of pre-built script from knowledge base
-  - `input_data` (optional, object): Parameters for knowledge base scripts
-  - `language` (optional, string, default: "applescript"): "applescript" or "javascript"
-  - `timeout_seconds` (optional, integer, default: 60): Execution timeout
+**Parameters (exactly one script source required):**
+- `script_content` (optional, string): Inline AppleScript/JXA code
+- `script_path` (optional, string): Path to script file
+- `kb_script_id` (optional, string): ID of pre-built script from knowledge base
+- `input_data` (optional, object): Parameters for knowledge base scripts
+- `language` (optional, string, default: "applescript"): "applescript" or "javascript"
+- `timeout_seconds` (optional, integer, default: 60): Execution timeout
 
 ---
 
