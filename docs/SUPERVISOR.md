@@ -164,7 +164,12 @@ class SupervisorAgent:
         # ...
 
     async def process(self, message, context) -> AsyncGenerator[SupervisorChunk, None]:
-        # Streams structured chunks back to Realtime
+        # Streams structured chunks back to Realtime.
+        # Emits complete only on successful termination.
+        # Emits error and stops early on stream/API failures.
+        # Converts malformed tool JSON into either:
+        # - a tool_start/tool_end failure pair when call_id exists, or
+        # - a terminal error chunk when call_id is missing
         # ...
 ```
 
@@ -238,6 +243,16 @@ Examples that should trigger escalation:
 2. Say: "Search the web for today's weather"
 3. Verify: Supervisor processes, TTS speaks result
 
+### Focused Stream Regression Tests
+
+Run the targeted async stream-path tests:
+
+1. `python -m unittest test_supervisor_stream_paths.py`
+2. Covers:
+   - stream `error` events do not leak a trailing `complete` chunk
+   - malformed tool JSON with `call_id` becomes a tool-scoped failure and continues
+   - malformed tool JSON without `call_id` emits a terminal `error`
+
 ## Troubleshooting
 
 ### Supervisor Not Responding
@@ -260,6 +275,10 @@ Examples that should trigger escalation:
 
 ## Version History
 
+- **v0.19** - Supervisor stream-path hardening
+  - Prevented `complete` from being emitted after stream `error`
+  - Added malformed tool-argument JSON handling in `process()`
+  - Added focused async behavioral tests in `test_supervisor_stream_paths.py`
 - **v0.18** - Initial Supervisor architecture implementation
   - Added `supervisor.py` with Responses API integration
   - Modified `main.py` for routing and integration

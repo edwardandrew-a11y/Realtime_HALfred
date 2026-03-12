@@ -1,9 +1,15 @@
 import json
 import re
+import time
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 from openai import OpenAI
+from session_logger import (
+    log_llm_call_sync,
+    log_llm_response_sync,
+    log_tool_dispatch_sync,
+)
 
 from anki_connect import (
     anki_invoke, AnkiConnectError, change_deck, find_cards, unsuspend_cards, are_suspended,
@@ -300,7 +306,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "deck": {"type": "string", "description": "Target deck name. Defaults to 'Default' if not specified."},
-                "model": {"type": "string", "description": "Note model (e.g., 'Cloze', 'Basic'). Defaults to 'Basic' if not specified."},
+                "model": {"type": "string", "description": "Note model (e.g., 'Cloze', 'Basic'). Defaults to 'Cloze' if not specified."},
                 "fields": {
                     "type": "object",
                     "additionalProperties": {"type": "string"},
@@ -356,6 +362,20 @@ def iter_tool_calls(resp: Any):
         # Most common: "tool_call". Some SDKs may label function calls differently.
         if item_type in ("tool_call", "function_call"):
             yield item
+
+
+def parse_tool_args(raw_args: Any) -> Dict[str, Any]:
+    """Normalize Responses API tool arguments into a dict."""
+    if raw_args is None:
+        return {}
+    if isinstance(raw_args, dict):
+        return raw_args
+    if isinstance(raw_args, str):
+        parsed = json.loads(raw_args)
+        if isinstance(parsed, dict):
+            return parsed
+        raise ValueError("Tool arguments must decode to a JSON object.")
+    raise TypeError(f"Unsupported tool argument type: {type(raw_args).__name__}")
 
 
 # -----------------------------
@@ -445,7 +465,7 @@ def dispatch_tool(name: str, args: Dict[str, Any]) -> Any:
     if name == "anki_gui_add_cards":
         # Use defaults if parameters not provided (allows just opening the dialog)
         deck = args.get("deck", "Default")
-        model = args.get("model", "AnKingOverhaul")
+        model = args.get("model", "Cloze")
         fields = args.get("fields", {"Text": "", "Extra": ""})
 
         note = {
@@ -490,13 +510,37 @@ class AnkiSubagent:
         }
         self.messages: List[Dict[str, str]] = []
 
+    def _update_state_from_tool_result(
+        self,
+        tool_name: str,
+        args: Dict[str, Any],
+        result: Any,
+    ) -> None:
+        if not isinstance(result, dict) or result.get("error") or result.get("ok") is False:
+            return
+
+        if tool_name in {
+            "anki_add_cloze",
+            "anki_create_deck",
+            "anki_change_deck",
+            "anki_gui_add_cards",
+            "anki_gui_deck_review",
+        } and args.get("deck"):
+            self.state["last_deck"] = args["deck"]
+
+        if tool_name == "anki_add_cloze" and result.get("note_id"):
+            self.state["last_note_ids"] = [result["note_id"]]
+        elif tool_name == "anki_find_notes" and isinstance(result.get("note_ids"), list):
+            self.state["last_note_ids"] = result["note_ids"]
+        elif tool_name == "anki_notes_info" and isinstance(args.get("note_ids"), list):
+            self.state["last_note_ids"] = args["note_ids"]
+        elif tool_name == "anki_update_note_fields" and args.get("note_id") is not None:
+            self.state["last_note_ids"] = [args["note_id"]]
+        elif tool_name == "anki_add_tags" and isinstance(args.get("note_ids"), list):
+            self.state["last_note_ids"] = args["note_ids"]
+
     def _run_turn(self, user_message: str) -> str:
         """Execute a single agent turn with tool calls."""
-        import time
-        from session_logger import (
-            log_llm_call_sync, log_llm_response_sync, log_tool_dispatch_sync
-        )
-
         print(f"[anki_agent] Received: {user_message[:100]}...")
         self.messages.append({"role": "user", "content": user_message})
 
@@ -530,7 +574,7 @@ class AnkiSubagent:
 
         print(f"[anki_agent] Tool calls: {len(tool_calls)} | Text output: {bool(resp.output_text)}")
         if not tool_calls:
-            reply = resp.output_text
+            reply = resp.output_text or '{"status":"error","action":"other","summary":"Model returned no text output"}'
             print(f"[anki_agent] NO TOOLS CALLED - returning text: {reply[:100]}...")
             self.messages.append({"role": "assistant", "content": reply})
             return reply
@@ -547,31 +591,43 @@ class AnkiSubagent:
             print(f"[anki_agent] Calling tools: {[c.name for c in current_tool_calls]}")
 
             # Execute tool calls and send results back
-            tool_messages: List[Dict[str, str]] = []
+            tool_messages: List[Dict[str, Any]] = []
             for call in current_tool_calls:
                 tool_name = call.name
                 raw_args = call.arguments
-                args = raw_args if isinstance(raw_args, dict) else json.loads(raw_args)
-                print(f"[anki_agent] Executing tool: {tool_name} with args: {args}")
-
-                # Memory read: if the tool is add_cloze and deck is missing, inject last_deck
-                if tool_name == "anki_add_cloze" and not args.get("deck") and self.state.get("last_deck"):
-                    args["deck"] = self.state["last_deck"]
-
-                # Guardrail: ensure cloze syntax if adding cloze
                 tool_start = time.time()
-                if tool_name == "anki_add_cloze" and not looks_like_cloze(args.get("text", "")):
-                    result = {"error": "Cloze text must include {{c1::...}} syntax. Please generate valid cloze deletions."}
+
+                try:
+                    args = parse_tool_args(raw_args)
+                except (json.JSONDecodeError, TypeError, ValueError) as e:
+                    args = {"_raw_arguments": raw_args}
+                    result = {"error": f"Invalid arguments for {tool_name}: {e}"}
                     success = False
+                    print(f"[anki_agent] Tool ARG ERROR: {tool_name}: {e}")
                 else:
-                    try:
-                        result = dispatch_tool(tool_name, args)
-                        success = "error" not in result if isinstance(result, dict) else True
-                        print(f"[anki_agent] Tool result: {str(result)[:200]}...")
-                    except AnkiConnectError as e:
-                        result = {"error": str(e)}
+                    print(f"[anki_agent] Executing tool: {tool_name} with args: {args}")
+
+                    # Memory read: if the tool is add_cloze and deck is missing, inject last_deck
+                    if tool_name == "anki_add_cloze" and not args.get("deck") and self.state.get("last_deck"):
+                        args["deck"] = self.state["last_deck"]
+
+                    # Guardrail: ensure cloze syntax if adding cloze
+                    if tool_name == "anki_add_cloze" and not looks_like_cloze(args.get("text", "")):
+                        result = {"error": "Cloze text must include {{c1::...}} syntax. Please generate valid cloze deletions."}
                         success = False
-                        print(f"[anki_agent] Tool ERROR: {e}")
+                    else:
+                        try:
+                            result = dispatch_tool(tool_name, args)
+                            success = "error" not in result if isinstance(result, dict) else True
+                            print(f"[anki_agent] Tool result: {str(result)[:200]}...")
+                        except AnkiConnectError as e:
+                            result = {"error": str(e)}
+                            success = False
+                            print(f"[anki_agent] Tool ERROR: {e}")
+                        except Exception as e:
+                            result = {"error": f"Unexpected tool error in {tool_name}: {type(e).__name__}: {e}"}
+                            success = False
+                            print(f"[anki_agent] Tool UNEXPECTED ERROR: {tool_name}: {e}")
 
                 # Log the tool dispatch
                 tool_duration = (time.time() - tool_start) * 1000
@@ -584,11 +640,8 @@ class AnkiSubagent:
                     duration_ms=tool_duration,
                 )
 
-                # Memory write: track last_deck and last_note_ids
-                if tool_name == "anki_add_cloze" and args.get("deck"):
-                    self.state["last_deck"] = args["deck"]
-                if tool_name == "anki_add_cloze" and isinstance(result, dict) and result.get("note_id"):
-                    self.state["last_note_ids"] = [result["note_id"]]
+                # Memory write: track deck/note context across successful tool calls
+                self._update_state_from_tool_result(tool_name, args, result)
 
                 tool_messages.append({
                     "type": "function_call_output",

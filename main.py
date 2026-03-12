@@ -520,6 +520,11 @@ class ElevenLabsTTS:
                 # Start async speech generation in background and track it
                 task = asyncio.create_task(self._speak_async(complete.strip()))
                 self._speaking_tasks.append(task)
+                # Prune completed tasks to prevent unbounded growth over long sessions.
+                # Append first so immediate-completion tasks can still be removed.
+                task.add_done_callback(
+                    lambda t: self._speaking_tasks.remove(t) if t in self._speaking_tasks else None
+                )
 
     async def _speak_async(self, text: str) -> None:
         # Stream the given text through ElevenLabs and feed bytes to AudioPlayer.
@@ -895,7 +900,7 @@ async def mic_send_loop(session, mic: MicStreamer, listen_state: ListenState):
                 # (The server auto-commits when speech_ended fires because create_response: True)
                 silence_chunk_size = 4800  # 0.1s of silence per chunk (4800 bytes = 2400 samples at 24kHz)
                 max_wait_time = 1.5  # Maximum 1.5 seconds to wait for speech_ended
-                start_time = asyncio.get_event_loop().time()
+                start_time = asyncio.get_running_loop().time()
 
                 # Clear the event before waiting
                 if listen_state.speech_ended_event:
@@ -920,7 +925,7 @@ async def mic_send_loop(session, mic: MicStreamer, listen_state: ListenState):
                         pass  # Continue sending silence
 
                     # Safety fallback: don't wait forever
-                    elapsed = asyncio.get_event_loop().time() - start_time
+                    elapsed = asyncio.get_running_loop().time() - start_time
                     if elapsed > max_wait_time:
                         safe_print(f"[mic_send] Timeout waiting for speech_ended ({elapsed:.1f}s), forcing commit")
                         # Force commit the audio buffer since VAD didn't detect speech end
@@ -2087,11 +2092,6 @@ async def main():
             _escalation_listen_state = listen_state
             _escalation_lock = asyncio.Lock()  # Prevents concurrent escalations
             print("[escalation] Module-level references set for escalation tool")
-
-            # Load push-to-talk configuration
-            ptt_enabled = os.getenv("PTT_ENABLED", "false").lower() == "true"
-            ptt_key = os.getenv("PTT_KEY", "cmd_alt")
-            ptt_interrupts = os.getenv("PTT_INTERRUPTS_SPEECH", "true").lower() == "true"
 
             # Create push-to-talk handlers
             on_ptt_press, on_ptt_release = create_ptt_handlers(

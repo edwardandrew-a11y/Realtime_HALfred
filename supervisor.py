@@ -14,6 +14,7 @@ Streams structured JSON responses back to the Realtime agent.
 
 import asyncio
 import inspect
+import time
 import json
 import os
 from dataclasses import dataclass, field
@@ -390,7 +391,6 @@ Examples:
 
     async def _execute_tool(self, tool_name: str, args: dict) -> Any:
         """Execute a tool by name (native or MCP)."""
-        import time
         from session_logger import get_global_logger
 
         logger = get_global_logger()
@@ -520,33 +520,24 @@ Examples:
                 current_round += 1
                 print(f"[supervisor_debug] === Round {current_round} ===")
 
-                # Create streaming response (async to avoid blocking the event loop)
+                create_kwargs: Dict[str, Any] = {
+                    "model": self.model,
+                    "input": next_input,
+                    "tools": tools,
+                    "previous_response_id": current_response_id,
+                    "store": True,
+                    "stream": True,
+                }
                 if is_initial:
-                    response = await self.client.responses.create(
-                        model=self.model,
-                        input=next_input,
-                        tools=tools,
-                        instructions=self.INSTRUCTIONS,
-                        previous_response_id=current_response_id,
-                        store=True,
-                        stream=True,
-                    )
+                    create_kwargs["instructions"] = self.INSTRUCTIONS
                     is_initial = False
-                else:
-                    # Continuation with tool outputs
-                    response = await self.client.responses.create(
-                        model=self.model,
-                        previous_response_id=current_response_id,
-                        input=next_input,
-                        tools=tools,
-                        store=True,
-                        stream=True,
-                    )
+                response = await self.client.responses.create(**create_kwargs)
 
                 # Collect function calls for this round
                 pending_function_calls = []  # List of (call_id, tool_name, result_str)
                 function_call_items = {}  # item_id -> {name, call_id}
                 got_text_output = False
+                stream_error = None
 
                 # Process streaming events (async iteration keeps event loop free)
                 async for event in response:
@@ -589,7 +580,33 @@ Examples:
                             call_id = getattr(event, 'call_id', None)
 
                         raw_args = getattr(event, 'arguments', '{}')
-                        args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                        try:
+                            args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                        except json.JSONDecodeError as e:
+                            error_text = f"Invalid tool arguments for {tool_name or 'unknown_tool'}: {e}"
+                            if call_id:
+                                yield SupervisorChunk(
+                                    type="tool_start",
+                                    content=tool_name or "unknown_tool",
+                                    metadata={"raw_args": raw_args}
+                                )
+                                yield SupervisorChunk(
+                                    type="tool_end",
+                                    content=tool_name or "unknown_tool",
+                                    metadata={"error": str(e), "success": False}
+                                )
+                                pending_function_calls.append((
+                                    call_id,
+                                    tool_name,
+                                    json.dumps({"error": error_text}),
+                                ))
+                                continue
+                            stream_error = error_text
+                            yield SupervisorChunk(
+                                type="error",
+                                content=error_text
+                            )
+                            break
 
                         yield SupervisorChunk(
                             type="tool_start",
@@ -633,10 +650,15 @@ Examples:
 
                     elif event_type == "error":
                         error = getattr(event, 'error', 'Unknown error')
+                        stream_error = str(error)
                         yield SupervisorChunk(
                             type="error",
                             content=str(error)
                         )
+                        break
+
+                if stream_error:
+                    return
 
                 print(f"[supervisor_debug] Round {current_round} done. pending_calls={len(pending_function_calls)}, got_text={got_text_output}")
 
@@ -657,7 +679,7 @@ Examples:
                         "call_id": call_id,
                         "output": result_str,
                     }
-                    for call_id, tool_name, result_str in pending_function_calls
+                    for call_id, _, result_str in pending_function_calls
                 ]
                 print(f"[supervisor_debug] Sending {len(next_input)} tool outputs for next round...")
 
