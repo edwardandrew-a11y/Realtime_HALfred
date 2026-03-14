@@ -353,6 +353,28 @@ Hoisted all four imports to module scope.
 
 ---
 
+## SESSION-001: Realtime session expiry after long idle/runtime
+
+**Status:** Fixed (2026-03-12)
+**Severity:** Medium (forced full app restart after websocket expiry)
+**Location:** `main.py` — session lifecycle / dormant reconnect flow
+
+### Description
+
+The OpenAI Realtime websocket has a hard 60-minute session cap. Earlier HALfred builds treated the Realtime session as process-lifetime, so a `session_expired` error or long idle timeout forced the user to restart the entire program and wait for audio, MCP, and supervisor initialization again.
+
+### Fix Applied
+
+HALfred now separates process lifetime from websocket-session lifetime:
+
+- Idle sessions enter a dormant state after `DORMANT_TIMEOUT_MINUTES`
+- Pressing PTT or sending text wakes the app and reconnects the Realtime websocket
+- The app proactively rotates the websocket before the 60-minute hard cap using `SESSION_MAX_MINUTES`
+- MCP servers, the Supervisor agent, keyboard listener, mic pipeline, and logger stay loaded across reconnects
+- `/retry` provides manual recovery if reconnect attempts fail
+
+---
+
 ## Document History
 
 | Date | Change |
@@ -363,3 +385,4 @@ Hoisted all four imports to module scope.
 | 2026-02-28 | Added ASYNC-001 (resolved): `get_event_loop()` → `get_running_loop()` in `mic_send_loop` |
 | 2026-02-28 | Added DEAD-001 (resolved): removed duplicate PTT env-var block in `main()` |
 | 2026-03-08 | Added ANKI-001 through ANKI-005 (all resolved): AG2 debate review of `anki_agent.py` |
+| 2026-03-12 | Added SESSION-001 (resolved): dormant reconnect + proactive session rotation for Realtime websocket expiry |

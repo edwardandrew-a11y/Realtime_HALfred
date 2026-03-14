@@ -440,6 +440,7 @@ python main.py
 - **`/ptt`** - Toggle push-to-talk mode
 - **`/stop`** - Interrupt HALfred's speech immediately
 - **`/mcp`** - List all available MCP tools and servers
+- **`/retry`** - Retry the Realtime connection after a reconnect failure
 - **`/quit` or `/exit`** - Exit the program
 
 ### Voice Interaction Modes
@@ -449,6 +450,7 @@ When continuous listening is enabled:
 - Halfred automatically detects when you start and stop speaking (semantic VAD)
 - Microphone automatically mutes while Halfred is speaking (prevents echo)
 - Automatically resumes listening after Halfred finishes responding
+- If the Realtime websocket is dormant, `/mic` wakes and reconnects it before resuming hands-free listening
 
 #### Push-to-Talk Mode (`/ptt`)
 When push-to-talk is enabled:
@@ -457,12 +459,23 @@ When push-to-talk is enabled:
 - Release keys to send your message to Halfred
 - Automatically interrupts Halfred's speech when you press the PTT keys
 - Can be customized via `PTT_KEY` in `.env` (options: `cmd_alt`, `space`, `ctrl`, `shift`, etc.)
+- If the Realtime websocket is dormant, pressing PTT wakes it and buffers your first utterance during reconnect
 
 **macOS Permissions Required:**
 - System Settings → Privacy & Security → Accessibility
 - Grant permission for your Terminal or IDE to monitor keyboard events
 
 **Note:** By default, HALfred starts in continuous listening mode. Use `/ptt` to switch to push-to-talk, and `/mic` to switch back.
+
+### Dormant Session Lifecycle
+
+HALfred now keeps the app process alive even when the active Realtime websocket is closed for inactivity or proactive session rotation.
+
+- After `DORMANT_TIMEOUT_MINUTES` of no user activity, HALfred closes the active Realtime session and enters a dormant state
+- While dormant, the app, MCP servers, keyboard listener, microphone pipeline, and Supervisor agent stay loaded
+- Pressing PTT or typing a message wakes HALfred and reconnects the Realtime session automatically
+- HALfred also rotates the Realtime session before the API's 60-minute hard cap using `SESSION_MAX_MINUTES`
+- If reconnect attempts fail, HALfred enters a recoverable failed state and waits for `/retry` or `/quit`
 
 ## Architecture
 
@@ -625,6 +638,17 @@ python -c "import sounddevice as sd; print(sd.query_devices())"
 - Check network connection stability
 - Verify `eleven_turbo_v2_5` model is being used
 
+### Realtime session went dormant
+- This is expected after `DORMANT_TIMEOUT_MINUTES` of inactivity
+- Press PTT or type any message to wake the session
+- If reconnect fails, use `/retry`
+- To change the idle sleep window, set `DORMANT_TIMEOUT_MINUTES` in `.env`
+
+### Realtime session reconnects during long runs
+- This is expected near the Realtime API's 60-minute session limit
+- HALfred proactively rotates the websocket using `SESSION_MAX_MINUTES`, so the full app does not need to restart
+- Recent conversation context is lightly reseeded on reconnect to preserve continuity
+
 ## Environment Variables
 
 | Variable | Required | Default | Description |
@@ -637,6 +661,8 @@ python -c "import sounddevice as sd; print(sd.query_devices())"
 | `PTT_ENABLED` | No | `false` | Enable push-to-talk mode on startup |
 | `PTT_KEY` | No | `cmd_alt` | Keys for push-to-talk (`cmd_alt`, `space`, `ctrl`, `shift`, `alt`, or any letter) |
 | `PTT_INTERRUPTS_SPEECH` | No | `true` | Whether PTT activation interrupts HALfred's speech |
+| `DORMANT_TIMEOUT_MINUTES` | No | `30` | Minutes of inactivity before the Realtime websocket sleeps |
+| `SESSION_MAX_MINUTES` | No | `55` | Minutes before HALfred proactively rotates the Realtime session |
 | `MCP_SERVERS_JSON_FILE` | No | `MCP_SERVERS.json` | Path to MCP servers config file |
 | `MCP_CLIENT_TIMEOUT_SECONDS` | No | `30` | Timeout for MCP tool calls |
 | `MCP_DEMO_FILESYSTEM_DIR` | No | - | Optional demo filesystem MCP server |

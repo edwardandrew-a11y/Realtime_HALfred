@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 from contextlib import AsyncExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from dotenv import load_dotenv
 from typing import Callable, Optional
 
@@ -391,6 +391,16 @@ class ListenState:
     turn_state: str = "idle"        # Track commit state: "idle", "awaiting_speech_end", "committed"
     bytes_appended_since_commit: int = 0  # Track how much audio we've sent since last commit
     last_server_event_time: float = 0.0  # Timestamp of last event from server (for connection health)
+    last_user_activity_time: float = 0.0  # Timestamp of last user activity (for dormancy)
+    rotation_pending: bool = False  # Defer proactive rotation until the current turn is idle
+
+
+@dataclass
+class AppRuntimeState:
+    """Tracks app-level lifecycle state across session reconnects."""
+    state: str = "CONNECTING"
+    wake_event: asyncio.Event = field(default_factory=asyncio.Event)
+    retry_event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 @dataclass
@@ -400,6 +410,150 @@ class PTTState:
     on_press_callback: Optional[Callable] = None
     on_release_callback: Optional[Callable] = None
     ptt_key: str = "cmd_alt"
+
+
+@dataclass
+class LedgerEntry:
+    """A minimal conversation entry used to reseed new realtime sessions."""
+    role: str
+    text: str
+    timestamp: float
+
+
+class ConversationLedger:
+    """Tracks the recent user/assistant exchange across websocket reconnects."""
+
+    def __init__(self, max_entries: int = 50):
+        self._entries: list[LedgerEntry] = []
+        self._max_entries = max_entries
+        self._assistant_buffer = ""
+
+    def add(self, role: str, text: str) -> None:
+        text = text.strip()
+        if not text:
+            return
+        self._entries.append(LedgerEntry(role=role, text=text, timestamp=time.monotonic()))
+        if len(self._entries) > self._max_entries:
+            self._entries = self._entries[-self._max_entries:]
+
+    def append_assistant_delta(self, delta: str) -> None:
+        if delta:
+            self._assistant_buffer += delta
+
+    def commit_assistant_turn(self) -> str:
+        text = self._assistant_buffer.strip()
+        if text:
+            self.add("assistant", text)
+        self._assistant_buffer = ""
+        return text
+
+    def reset_assistant_buffer(self) -> None:
+        self._assistant_buffer = ""
+
+    def entry_count(self) -> int:
+        return len(self._entries)
+
+    def get_reseed_instructions(self, max_chars: int = 2000) -> str:
+        """Return a compact recent-history summary for new websocket sessions."""
+        if not self._entries:
+            return ""
+
+        lines: list[str] = []
+        remaining = max_chars
+        for entry in reversed(self._entries):
+            speaker = "User" if entry.role == "user" else "Halfred"
+            text = entry.text.replace("\n", " ").strip()
+            if len(text) > 220:
+                text = text[:217] + "..."
+            line = f"{speaker}: {text}"
+            line_len = len(line) + (1 if lines else 0)
+            if line_len > remaining:
+                break
+            lines.append(line)
+            remaining -= line_len
+
+        return "\n".join(reversed(lines))
+
+
+class SessionRouter:
+    """Serializes access to the current connected realtime session."""
+
+    def __init__(self, app_runtime: AppRuntimeState):
+        self._app_runtime = app_runtime
+        self._session = None
+        self._ready = asyncio.Event()
+        self._disconnecting = False
+
+    async def set_session(self, session) -> None:
+        self._disconnecting = False
+        self._session = session
+        self._ready.set()
+
+    def clear(self) -> None:
+        self._disconnecting = False
+        self._session = None
+        self._ready.clear()
+
+    async def ensure_ready(self):
+        """Wait until a session is connected, or fail if reconnect is not possible."""
+        while True:
+            state = self._app_runtime.state
+            if state == "SHUTTING_DOWN":
+                raise asyncio.CancelledError
+            if state == "CONNECT_FAILED":
+                raise RuntimeError("Realtime session is unavailable; use /retry to reconnect.")
+            if self._ready.is_set() and self._session is not None and not self._disconnecting:
+                return self._session
+            try:
+                await asyncio.wait_for(self._ready.wait(), timeout=0.25)
+            except asyncio.TimeoutError:
+                pass
+
+    async def send_audio(self, audio: bytes, *, commit: bool = False) -> None:
+        sess = await self.ensure_ready()
+        if self._disconnecting or self._session is not sess:
+            return
+        try:
+            await sess.send_audio(audio, commit=commit)
+        except Exception:
+            if self._disconnecting or self._session is not sess or self._app_runtime.state != "ACTIVE":
+                return
+            raise
+
+    async def send_message(self, message) -> None:
+        sess = await self.ensure_ready()
+        if self._disconnecting or self._session is not sess:
+            return
+        try:
+            await sess.send_message(message)
+        except Exception:
+            if self._disconnecting or self._session is not sess or self._app_runtime.state != "ACTIVE":
+                return
+            raise
+
+    async def interrupt(self) -> None:
+        sess = self._session
+        if sess is None or self._disconnecting:
+            return
+        await sess.interrupt()
+
+    async def close_current(self) -> None:
+        """Capture and close the current session while blocking new writers."""
+        sess = self._session
+        self._ready.clear()
+        self._disconnecting = True
+        self._session = None
+
+        if sess is not None:
+            try:
+                await sess.__aexit__(None, None, None)
+            except Exception:
+                pass
+
+
+def set_app_state(app_runtime: AppRuntimeState, new_state: str) -> None:
+    """Centralize lifecycle state transitions."""
+    app_runtime.state = new_state
 
 
 class AudioPlayer:
@@ -651,7 +805,7 @@ class MicStreamer:
         self.channels = channels
         self.dtype = dtype
         self.mute_fn = mute_fn
-        self.queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+        self.queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=200)
         self._running = False
         self._stream = sd.RawInputStream(
             samplerate=self.samplerate,
@@ -703,7 +857,14 @@ class MicStreamer:
             return
         # indata is a bytes-like buffer for RawInputStream
         chunk = bytes(indata)
-        self.loop.call_soon_threadsafe(self.queue.put_nowait, chunk)
+        
+        def _safe_put() -> None:
+            try:
+                self.queue.put_nowait(chunk)
+            except asyncio.QueueFull:
+                pass
+
+        self.loop.call_soon_threadsafe(_safe_put)
 
 
 class KeyboardListener:
@@ -852,6 +1013,9 @@ class KeyboardListener:
         """Start listening for keyboard events."""
         from pynput import keyboard
 
+        if self._listener:
+            return
+
         self._listener = keyboard.Listener(
             on_press=self._on_press,
             on_release=self._on_release
@@ -866,7 +1030,7 @@ class KeyboardListener:
             self._listener = None
 
 
-async def mic_send_loop(session, mic: MicStreamer, listen_state: ListenState):
+async def mic_send_loop(router: SessionRouter, mic: MicStreamer, listen_state: ListenState):
     # Bridge between MicStreamer and the RealtimeAgent session (agents/realtime.py):
     # forwards mic audio chunks to the session so the model can transcribe them.
     """Continuously send mic audio to the realtime session.
@@ -908,7 +1072,12 @@ async def mic_send_loop(session, mic: MicStreamer, listen_state: ListenState):
 
                 while listen_state.turn_state == "awaiting_speech_end":
                     # Send a chunk of silence to help VAD detect speech end
-                    await session.send_audio(b"\x00" * silence_chunk_size, commit=False)
+                    try:
+                        await router.send_audio(b"\x00" * silence_chunk_size, commit=False)
+                    except RuntimeError:
+                        listen_state.turn_state = "idle"
+                        listen_state.bytes_appended_since_commit = 0
+                        break
                     listen_state.bytes_appended_since_commit += silence_chunk_size
 
                     # Wait for speech_ended event with a short timeout
@@ -929,14 +1098,12 @@ async def mic_send_loop(session, mic: MicStreamer, listen_state: ListenState):
                     if elapsed > max_wait_time:
                         safe_print(f"[mic_send] Timeout waiting for speech_ended ({elapsed:.1f}s), forcing commit")
                         # Force commit the audio buffer since VAD didn't detect speech end
-                        await session.send_audio(b"\x00" * silence_chunk_size, commit=True)
-                        # Wait briefly for the commit to be processed by the server
-                        await asyncio.sleep(0.1)
-                        # Manually trigger response creation since VAD's auto-trigger was bypassed
-                        safe_print(f"[mic_send] Triggering response creation after forced commit")
-                        await session._model.send_event(
-                            RealtimeModelSendRawMessage(message={"type": "response.create"})
-                        )
+                        try:
+                            await router.send_audio(b"\x00" * silence_chunk_size, commit=True)
+                        except RuntimeError:
+                            listen_state.turn_state = "idle"
+                            listen_state.bytes_appended_since_commit = 0
+                            break
                         listen_state.turn_state = "committed"
                         listen_state.bytes_appended_since_commit = 0
                         break
@@ -946,14 +1113,23 @@ async def mic_send_loop(session, mic: MicStreamer, listen_state: ListenState):
                 silence_duration_samples = 12000  # 0.5 seconds at 24kHz
                 silence_bytes = b"\x00" * (silence_duration_samples * 2)  # 2 bytes per int16 sample
                 safe_print(f"[mic_send] Committing turn ({listen_state.bytes_appended_since_commit} bytes sent, {len(silence_bytes)} silence bytes)")
-                await session.send_audio(silence_bytes, commit=True)
+                try:
+                    await router.send_audio(silence_bytes, commit=True)
+                except RuntimeError:
+                    listen_state.turn_state = "idle"
+                    listen_state.bytes_appended_since_commit = 0
+                    continue
                 listen_state.bytes_appended_since_commit = 0
 
             continue
 
         # Regular audio chunk - append it and track bytes
         listen_state.bytes_appended_since_commit += len(chunk)
-        await session.send_audio(chunk)
+        try:
+            await router.send_audio(chunk)
+        except RuntimeError:
+            listen_state.bytes_appended_since_commit = 0
+            continue
 
 
 def create_ptt_handlers(
@@ -961,8 +1137,9 @@ def create_ptt_handlers(
     player: AudioPlayer,
     tts: Optional[ElevenLabsTTS],
     listen_state: ListenState,
-    session,
-    loop: asyncio.AbstractEventLoop
+    session_router: SessionRouter,
+    loop: asyncio.AbstractEventLoop,
+    app_runtime: AppRuntimeState,
 ):
     """Create callback functions for push-to-talk key press and release.
 
@@ -978,6 +1155,26 @@ def create_ptt_handlers(
         # Reset turn state for new recording
         listen_state.turn_state = "idle"
         listen_state.bytes_appended_since_commit = 0
+        listen_state.last_user_activity_time = time.monotonic()
+
+        if app_runtime.state in {"CONNECTING", "ROTATING"}:
+            if not mic.running:
+                mic.start()
+            safe_print("\n[ptt] >> RECORDING (connecting session)...")
+            return
+
+        if app_runtime.state == "DORMANT":
+            if not mic.running:
+                mic.start()
+            safe_print("\n[ptt] >> RECORDING (waking session)...")
+            loop.call_soon_threadsafe(app_runtime.wake_event.set)
+            return
+
+        if app_runtime.state == "CONNECT_FAILED":
+            safe_print("\n[ptt] Session unavailable. Type /retry to reconnect.")
+            listen_state.ptt_active = False
+            return
+
         safe_print("\n[ptt] >> RECORDING (keys held) - speak now...")
 
         # If configured, interrupt any current speech (only if actually speaking)
@@ -992,7 +1189,7 @@ def create_ptt_handlers(
 
                 # Also tell OpenAI to stop its current response
                 loop.call_soon_threadsafe(
-                    lambda: asyncio.create_task(session.interrupt())
+                    lambda: asyncio.create_task(session_router.interrupt())
                 )
 
         # Start the microphone
@@ -1159,7 +1356,44 @@ async def escalate_to_supervisor(request: str) -> str:
         })
 
 
-async def user_input_loop(session, mic: MicStreamer, player: AudioPlayer, listen_state: ListenState, mcp_servers, ptt_state: PTTState, tts: Optional[ElevenLabsTTS] = None):
+async def _ensure_active(
+    router: SessionRouter,
+    listen_state: ListenState,
+    app_runtime: AppRuntimeState,
+) -> bool:
+    """Wake a dormant session and wait until a live websocket is ready."""
+    if app_runtime.state == "CONNECT_FAILED":
+        safe_print("[session] Reconnect failed. Use /retry or /quit.")
+        return False
+
+    if app_runtime.state == "DORMANT":
+        listen_state.last_user_activity_time = time.monotonic()
+        safe_print("[dormant] Waking session...")
+        app_runtime.wake_event.set()
+
+    try:
+        await router.ensure_ready()
+    except RuntimeError as e:
+        safe_print(f"[session] {e}")
+        return False
+    except asyncio.CancelledError:
+        return False
+
+    return True
+
+
+async def user_input_loop(
+    router: SessionRouter,
+    mic: MicStreamer,
+    player: AudioPlayer,
+    listen_state: ListenState,
+    mcp_servers,
+    ptt_state: PTTState,
+    app_runtime: AppRuntimeState,
+    context_manager: ContextManager,
+    ledger: ConversationLedger,
+    tts: Optional[ElevenLabsTTS] = None,
+):
     # Handles console input from the user. It controls mic state, lists MCP tools,
     # and exposes DEV_MODE shortcuts that call helpers in automation_safety.py
     # (e.g., take_screenshot, test_highlight) against the configured MCP servers.
@@ -1167,7 +1401,7 @@ async def user_input_loop(session, mic: MicStreamer, player: AudioPlayer, listen
     dev_cmds = ""
     if os.getenv("DEV_MODE", "false").lower() == "true":
         dev_cmds = ", /screeninfo, /screenshot [full|active], /highlight x y w h, /confirm_test, /demo_click"
-    print(f"\nType messages. Commands: /mic (continuous listen), /ptt (push-to-talk), /stop (interrupt speech), /mcp (list tools), /quit{dev_cmds}\n")
+    print(f"\nType messages. Commands: /mic (continuous listen), /ptt (push-to-talk), /stop (interrupt speech), /mcp (list tools), /retry, /quit{dev_cmds}\n")
 
     def show_status_prompt():
         """Display current mode status before the prompt."""
@@ -1193,12 +1427,26 @@ async def user_input_loop(session, mic: MicStreamer, player: AudioPlayer, listen
             # Clear the flag after input is received
             _input_active.clear()
 
+        if msg:
+            listen_state.last_user_activity_time = time.monotonic()
+
         if msg.lower() in {"/quit", "/exit"}:
             # Gracefully shut down the session and microphone.
+            set_app_state(app_runtime, "SHUTTING_DOWN")
             listen_state.enabled = False
             mic.stop(commit=False)
-            await session.close()
+            app_runtime.wake_event.set()
+            app_runtime.retry_event.set()
+            await router.close_current()
             return
+
+        if msg.lower() == "/retry":
+            if app_runtime.state == "CONNECT_FAILED":
+                safe_print("[session] Retrying realtime connection...")
+                app_runtime.retry_event.set()
+            else:
+                safe_print("[session] Retry is only needed after a reconnect failure.")
+            continue
 
         if msg.lower() == "/mic":
             # Switch to continuous listening mode
@@ -1206,6 +1454,9 @@ async def user_input_loop(session, mic: MicStreamer, player: AudioPlayer, listen
                 # Already in continuous mode
                 print("[ERROR] Already in continuous listening mode")
                 print("        Use /ptt to switch to push-to-talk mode")
+                continue
+
+            if not await _ensure_active(router, listen_state, app_runtime):
                 continue
 
             # Disable PTT mode if active
@@ -1222,7 +1473,7 @@ async def user_input_loop(session, mic: MicStreamer, player: AudioPlayer, listen
             print("[mic] Continuous listening mode ON")
             print("      Speak naturally; I'll stop listening while I'm talking")
             # If the agent is speaking, cut it off when the user starts talking
-            await session.interrupt()   # Stop any current AI speech
+            await router.interrupt()   # Stop any current AI speech
             player.clear()
             mic.start()     # Start capturing user's speech
             continue
@@ -1259,9 +1510,11 @@ async def user_input_loop(session, mic: MicStreamer, player: AudioPlayer, listen
 
         if msg.lower() == "/stop":
             # Interrupt HALfred's current speech
+            if not await _ensure_active(router, listen_state, app_runtime):
+                continue
             if tts:
                 tts.interrupt()
-            await session.interrupt()
+            await router.interrupt()
             print("[stop] Speech interrupted")
             continue
 
@@ -1355,10 +1608,16 @@ async def user_input_loop(session, mic: MicStreamer, player: AudioPlayer, listen
         if not msg:
             continue
 
+        listen_state.last_user_activity_time = time.monotonic()
+        if not await _ensure_active(router, listen_state, app_runtime):
+            continue
+
         # Text input still works for debugging.
         # Send plain text directly to the realtime session (agents/realtime.py) without audio.
+        context_manager.add_turn("user", msg)
+        ledger.add("user", msg)
         safe_print(f"[realtime_client] conversation.item.create (type: message, content: text)")
-        await session.send_message(msg)
+        await router.send_message(msg)
 
 
 async def connection_health_monitor(listen_state: ListenState):
@@ -1417,6 +1676,94 @@ async def keepalive_loop(session, mic: MicStreamer, listen_state: ListenState):
                 pass
         except Exception as e:
             safe_print(f"[keepalive] Failed to send keepalive: {e}")
+
+
+async def dormancy_monitor(
+    router: SessionRouter,
+    mic: MicStreamer,
+    listen_state: ListenState,
+    app_runtime: AppRuntimeState,
+    dormant_timeout_s: float,
+    session_start_time: float,
+    escalation_lock: Optional[asyncio.Lock],
+    max_session_s: float,
+):
+    """Close idle sessions before the hard cap and put the app into dormancy."""
+    while True:
+        await asyncio.sleep(30)
+
+        now = time.monotonic()
+        idle_time = now - listen_state.last_user_activity_time
+        session_age = now - session_start_time
+        lock_active = escalation_lock.locked() if escalation_lock else False
+        rotation_due = session_age > max_session_s
+
+        if rotation_due:
+            if listen_state.turn_state == "idle" and not listen_state.ptt_active and not lock_active:
+                set_app_state(app_runtime, "ROTATING")
+                safe_print("[session] Proactive rotation (approaching session limit)")
+                if mic.running and listen_state.enabled and not listen_state.ptt_mode:
+                    mic.stop(commit=False)
+                await router.close_current()
+                return
+            listen_state.rotation_pending = True
+
+        if listen_state.rotation_pending and listen_state.turn_state == "idle" and not listen_state.ptt_active and not lock_active:
+            listen_state.rotation_pending = False
+            set_app_state(app_runtime, "ROTATING")
+            safe_print("[session] Deferred rotation - turn complete, reconnecting")
+            if mic.running and listen_state.enabled and not listen_state.ptt_mode:
+                mic.stop(commit=False)
+            await router.close_current()
+            return
+
+        if session_age > (max_session_s + 90):
+            set_app_state(app_runtime, "ROTATING")
+            safe_print("[session] Forced rotation - near hard session cap")
+            if mic.running and listen_state.enabled and not listen_state.ptt_mode:
+                mic.stop(commit=False)
+            await router.close_current()
+            return
+
+        should_sleep = (
+            idle_time > dormant_timeout_s
+            and listen_state.turn_state == "idle"
+            and not listen_state.ptt_active
+            and not lock_active
+        )
+        if should_sleep:
+            set_app_state(app_runtime, "DORMANT")
+            safe_print(f"[dormant] No activity for {idle_time / 60:.1f} minutes. Sleeping session.")
+            if mic.running:
+                mic.stop(commit=False)
+            await router.close_current()
+            return
+
+
+async def connect_with_retry(build_runner) -> tuple[RealtimeRunner, RealtimeSession]:
+    """Open a realtime websocket with bounded retries and timeout around __aenter__."""
+    connect_timeout_s = 10.0
+    max_connect_retries = 3
+    backoff_base = 2.0
+
+    for attempt in range(max_connect_retries):
+        runner = build_runner()
+        session = await runner.run()
+        try:
+            await asyncio.wait_for(session.__aenter__(), timeout=connect_timeout_s)
+            return runner, session
+        except Exception as e:
+            try:
+                await session.__aexit__(type(e), e, e.__traceback__)
+            except Exception:
+                pass
+
+            if attempt < max_connect_retries - 1:
+                wait_s = backoff_base ** attempt
+                safe_print(f"[session] Connect attempt {attempt + 1} failed: {e}. Retry in {wait_s:.0f}s")
+                await asyncio.sleep(wait_s)
+
+    raise RuntimeError(f"Failed to connect after {max_connect_retries} attempts")
 
 
 async def handle_screenshot_image(session, tool_output: str):
@@ -1652,6 +1999,8 @@ async def event_loop(
     player: AudioPlayer,
     mic: MicStreamer,
     listen_state: ListenState,
+    app_runtime: AppRuntimeState,
+    ledger: ConversationLedger,
     tts: Optional[ElevenLabsTTS] = None,
     logger: Optional['SessionLogger'] = None,
     supervisor: Optional[SupervisorAgent] = None,
@@ -1682,7 +2031,7 @@ async def event_loop(
             listen_state.turn_state = "idle"
 
             # Restart microphone after ElevenLabs finishes speaking; if continuous mode is ON
-            if listen_state.enabled and not mic.running:
+            if listen_state.enabled and not listen_state.ptt_mode and not mic.running and app_runtime.state == "ACTIVE":
                 safe_print("[mic] Restarting microphone after response")
                 mic.start()
 
@@ -1716,7 +2065,7 @@ async def event_loop(
             # This code is only used if the RealtimeAPI modality is audio, and Elevenlabs is disabled
             # Agent finished speaking
             safe_print("[audio_end]")
-            if listen_state.enabled:
+            if listen_state.enabled and not listen_state.ptt_mode and app_runtime.state == "ACTIVE":
                 mic.start()
 
         elif et == "audio_interrupted":
@@ -1740,10 +2089,14 @@ async def event_loop(
                 if t == "response.output_text.delta":
                     delta = raw_evt.get("delta", "")
                     safe_print(delta, end="", flush=True)
+                    ledger.append_assistant_delta(delta)
                     # Send text to ElevenLabs for TTS
                     if tts and delta:
                         tts.add_text(delta)
                 elif t == "response.output_text.done":
+                    assistant_text = ledger.commit_assistant_turn()
+                    if context_manager and assistant_text:
+                        context_manager.add_turn("assistant", assistant_text)
                     safe_print("")  # newline
                     safe_print(f"[realtime_event] response.output_text.done")
                     # Flush remaining text to ElevenLabs
@@ -1754,22 +2107,26 @@ async def event_loop(
                 elif t == "conversation.item.input_audio_transcription.completed":
                     transcript = raw_evt.get("transcript", "")
                     safe_print(f"[transcription] \"{transcript}\"")
+                    listen_state.last_user_activity_time = time.monotonic()
 
                     # Track conversation context (escalation now handled via tool call)
                     if context_manager and transcript.strip():
                         context_manager.add_turn("user", transcript)
+                    ledger.add("user", transcript)
                 elif t == "conversation.item.input_audio_transcription.failed":
                     safe_print(f"[transcription_failed] {raw_evt.get('error', 'Unknown error')}")
 
                 # Log critical session events that show turn/response flow
                 elif t == "input_audio_buffer.committed":
                     safe_print(f"[audio_committed] Audio buffer committed to session")
+                    listen_state.last_user_activity_time = time.monotonic()
                     # Mark as committed when server auto-commits (with create_response: True)
                     if listen_state.turn_state == "awaiting_speech_end":
                         listen_state.turn_state = "committed"
                         listen_state.bytes_appended_since_commit = 0
                 elif t == "input_audio_buffer.speech_started":
                     safe_print(f"[speech_detected] VAD detected speech starting")
+                    listen_state.last_user_activity_time = time.monotonic()
                 elif t == "input_audio_buffer.speech_stopped":
                     safe_print(f"[speech_ended] VAD detected speech ending")
                     # Signal that speech ended so mic_send_loop knows turn is complete
@@ -1791,6 +2148,7 @@ async def event_loop(
 
                 # Response events
                 elif t == "response.created":
+                    ledger.reset_assistant_buffer()
                     safe_print(f"[realtime_event] response.created")
                 elif t == "response.done":
                     safe_print(f"[realtime_event] response.done")
@@ -1809,6 +2167,11 @@ async def event_loop(
 
                 # Keep errors visible
                 elif t == "error":
+                    err = raw_evt.get("error", {}) if isinstance(raw_evt.get("error"), dict) else {}
+                    if err.get("code") == "session_expired":
+                        safe_print("[session] Server expired session - scheduling reconnect")
+                        set_app_state(app_runtime, "ROTATING")
+                        return
                     safe_print(f"\n[realtime_error] {raw_evt}\n")
 
                 # Log any other unhandled events
@@ -2016,53 +2379,6 @@ async def main():
             ptt_enabled = os.getenv("PTT_ENABLED", "false").lower() == "true"
             ptt_key = os.getenv("PTT_KEY", "cmd_alt")
             ptt_interrupts = os.getenv("PTT_INTERRUPTS_SPEECH", "true").lower() == "true"
-
-            # Create the OpenAI RealtimeAgent (agents/realtime.py) with minimal tools
-            # All MCP servers moved to Supervisor - Realtime is the "front desk"
-            agent = RealtimeAgent(
-                name="Halfred",
-                instructions=instructions,
-                tools=agent_tools,
-                mcp_servers=[],  # All MCPs handled by Supervisor now
-            )
-
-            # RealtimeRunner (agents/realtime.py) maintains the websocket connection to
-            # OpenAI's gpt-realtime model. We disable audio output here because we stream
-            # the assistant's text to ElevenLabs for speech.
-            # The quickstart shows model_name 'gpt-realtime' and typical audio/transcription/turn detection settings.  [oai_citation:6‡OpenAI GitHub Pages](https://openai.github.io/openai-agents-python/realtime/quickstart/)
-
-            # Turn detection: Always enabled for both PTT and continuous modes
-            # In PTT mode, we manually control when audio is sent, but VAD still detects end of speech
-            # In continuous mode, VAD detects both start and end of speech automatically
-            runner = RealtimeRunner(
-                starting_agent=agent,
-                config={  # type: ignore[arg-type]
-                    "model_settings": {
-                        "model_name": "gpt-realtime",
-                        # Using text-only output to capture assistant responses for ElevenLabs TTS
-                        "modalities": ["text"], # Output modalities: ["text"], ["audio"], or ["text", "audio"]
-                        "input_audio_format": "pcm16",  # Audio format: "pcm16" or "g711_ulaw" or "g711_alaw"
-                        "input_audio_noise_reduction": {
-                            "type": "near_field"  # or "far_field" or null to disable
-                        },
-                        # Turn detection enabled for both PTT and continuous modes
-                        "turn_detection": {
-                            "type": "semantic_vad",
-                            "eagerness": "medium",
-                            "create_response": True,
-                            "interrupt_response": True,
-                        },
-                        # Optional: get transcripts of the user's audio for debugging.
-                        "input_audio_transcription": {"model": "whisper-1"},
-
-                        # Temperature for response generation
-                        "temperature": 0.7,  # 0.6 to 1.2 (higher for more creative, lower for more conservative)
-                    }
-                },
-            )
-
-            # Establish the realtime session connection and prepare audio playback.
-            session = await runner.run()
             player = AudioPlayer(samplerate=24000)
             player.start()
 
@@ -2078,7 +2394,37 @@ async def main():
                 samplerate=24000,
                 mute_fn=None,    # set to 'lambda: player.is_playing()' to mute mic during elevenlabs playback
             )
-            listen_state = ListenState(speech_ended_event=asyncio.Event())
+            listen_state = ListenState(
+                speech_ended_event=asyncio.Event(),
+                last_user_activity_time=time.monotonic(),
+            )
+            listen_state.ptt_mode = ptt_enabled
+            listen_state.ptt_interrupts = ptt_interrupts
+            listen_state.enabled = not ptt_enabled
+
+            app_runtime = AppRuntimeState()
+            session_router = SessionRouter(app_runtime)
+            ledger = ConversationLedger(max_entries=50)
+
+            dormant_timeout_s = float(os.getenv("DORMANT_TIMEOUT_MINUTES", "30")) * 60.0
+            session_max_s = float(os.getenv("SESSION_MAX_MINUTES", "55")) * 60.0
+
+            runner_config = {  # type: ignore[var-annotated]
+                "model_settings": {
+                    "model_name": "gpt-realtime",
+                    "modalities": ["text"],
+                    "input_audio_format": "pcm16",
+                    "input_audio_noise_reduction": {"type": "near_field"},
+                    "turn_detection": {
+                        "type": "semantic_vad",
+                        "eagerness": "medium",
+                        "create_response": True,
+                        "interrupt_response": True,
+                    },
+                    "input_audio_transcription": {"model": "whisper-1"},
+                    "temperature": 0.7,
+                }
+            }
 
             # Set module-level references for the escalation tool
             # These allow escalate_to_supervisor to access runtime components
@@ -2099,13 +2445,10 @@ async def main():
                 player=player,
                 tts=tts,
                 listen_state=listen_state,
-                session=session,
-                loop=asyncio.get_running_loop()
+                session_router=session_router,
+                loop=asyncio.get_running_loop(),
+                app_runtime=app_runtime,
             )
-
-            # Set up the listen state for PTT mode
-            listen_state.ptt_mode = ptt_enabled
-            listen_state.ptt_interrupts = ptt_interrupts
 
             # Initialize keyboard listener if PTT is enabled
             keyboard_listener = None
@@ -2118,10 +2461,7 @@ async def main():
                 keyboard_listener.start()
                 print(f"[ptt] Push-to-talk enabled (hold '{ptt_key}' keys to speak)")
             else:
-                # If PTT is not enabled, start continuous listening by default
-                listen_state.enabled = True
-                mic.start()
-                print("[mic] Continuous listening mode active by default (speak naturally)")
+                print("[mic] Continuous listening mode will activate after the realtime session connects")
 
             # Create PTTState to pass to user_input_loop
             ptt_state = PTTState(
@@ -2131,46 +2471,141 @@ async def main():
                 ptt_key=ptt_key
             )
 
+            t_stdin = None
+            t_mic = None
             try:
-                async with session:
-                    print("✅ Realtime session started (using ElevenLabs TTS).")
-                    # Initialize connection health timestamp
-                    listen_state.last_server_event_time = time.monotonic()
+                t_stdin = asyncio.create_task(
+                    user_input_loop(
+                        session_router,
+                        mic,
+                        player,
+                        listen_state,
+                        mcp_servers,
+                        ptt_state,
+                        app_runtime,
+                        context_manager,
+                        ledger,
+                        tts,
+                    ),
+                    name="user_input",
+                )
+                t_mic = asyncio.create_task(mic_send_loop(session_router, mic, listen_state), name="mic_send")
 
-                    # Run console input, event handling, mic streaming, and connection monitoring at the same time.
-                    # These tasks all share the session/player/mic/tts objects defined above.
-                    t1 = asyncio.create_task(user_input_loop(session, mic, player, listen_state, mcp_servers, ptt_state, tts), name="user_input")
-                    t2 = asyncio.create_task(event_loop(session, player, mic, listen_state, tts, logger, supervisor, context_manager), name="event_loop")
-                    t3 = asyncio.create_task(mic_send_loop(session, mic, listen_state), name="mic_send")
-                    t4 = asyncio.create_task(connection_health_monitor(listen_state), name="health_monitor")
-                    t5 = asyncio.create_task(keepalive_loop(session, mic, listen_state), name="keepalive")
-                    done, pending = await asyncio.wait({t1, t2, t3, t4, t5}, return_when=asyncio.FIRST_COMPLETED)
+                while app_runtime.state != "SHUTTING_DOWN":
+                    if app_runtime.state == "DORMANT":
+                        safe_print("[dormant] HALfred sleeping. Press PTT or type to wake.")
+                        app_runtime.wake_event.clear()
+                        await app_runtime.wake_event.wait()
+                        if app_runtime.state == "SHUTTING_DOWN":
+                            break
 
-                    # Diagnose which task completed and why
-                    for task in done:
-                        task_name = task.get_name()
-                        print(f"\n[main] Task '{task_name}' completed, triggering shutdown...")
+                    if app_runtime.state == "CONNECT_FAILED":
+                        safe_print("[session] Waiting for /retry...")
+                        await app_runtime.retry_event.wait()
+                        app_runtime.retry_event.clear()
+                        if app_runtime.state == "SHUTTING_DOWN":
+                            break
 
-                        # Check if task raised an exception
-                        try:
-                            exception = task.exception()
-                            if exception:
-                                print(f"[main] ❌ Task '{task_name}' failed with exception:")
-                                import traceback
-                                traceback.print_exception(type(exception), exception, exception.__traceback__)
-                                # Log the exception
-                                await logger.log_error(exception, context=f"main_task_{task_name}")
-                            else:
-                                print(f"[main] Task '{task_name}' completed normally (no exception)")
-                        except asyncio.CancelledError:
-                            print(f"[main] Task '{task_name}' was cancelled")
-                        except Exception as e:
-                            print(f"[main] Could not retrieve exception from task '{task_name}': {e}")
+                    app_runtime.wake_event.clear()
+                    set_app_state(app_runtime, "CONNECTING")
 
-                    # Cancel pending tasks
-                    for task in pending:
-                        task.cancel()
+                    def build_runner() -> RealtimeRunner:
+                        current_instructions = instructions
+                        reseed = ledger.get_reseed_instructions()
+                        if reseed:
+                            current_instructions += (
+                                "\n# Previous Conversation Context\n"
+                                "- Maintain continuity from the recent exchange below.\n"
+                                "- Use it as background context only.\n"
+                                f"{reseed}\n"
+                            )
+                        agent = RealtimeAgent(
+                            name="Halfred",
+                            instructions=current_instructions,
+                            tools=agent_tools,
+                            mcp_servers=[],
+                        )
+                        return RealtimeRunner(starting_agent=agent, config=runner_config)
+
+                    try:
+                        _runner, session = await connect_with_retry(build_runner)
+                    except Exception as e:
+                        safe_print(f"[session] ❌ All connect attempts failed: {e}")
+                        mic.stop(commit=False)
+                        set_app_state(app_runtime, "CONNECT_FAILED")
+                        continue
+
+                    pending: set[asyncio.Task] = set()
+                    done: set[asyncio.Task] = set()
+                    try:
+                        await session_router.set_session(session)
+                        set_app_state(app_runtime, "ACTIVE")
+                        listen_state.last_server_event_time = time.monotonic()
+                        listen_state.rotation_pending = False
+                        if listen_state.enabled and not listen_state.ptt_mode and not mic.running:
+                            mic.start()
+                            print("[mic] Continuous listening mode active (speak naturally)")
+
+                        print("✅ Realtime session started (using ElevenLabs TTS).")
+                        session_start_time = time.monotonic()
+
+                        t_event = asyncio.create_task(
+                            event_loop(session, player, mic, listen_state, app_runtime, ledger, tts, logger, supervisor, context_manager),
+                            name="event_loop",
+                        )
+                        t_health = asyncio.create_task(connection_health_monitor(listen_state), name="health_monitor")
+                        t_keepalive = asyncio.create_task(keepalive_loop(session, mic, listen_state), name="keepalive")
+                        t_dormancy = asyncio.create_task(
+                            dormancy_monitor(
+                                session_router,
+                                mic,
+                                listen_state,
+                                app_runtime,
+                                dormant_timeout_s,
+                                session_start_time,
+                                _escalation_lock,
+                                session_max_s,
+                            ),
+                            name="dormancy",
+                        )
+                        pending = {t_event, t_health, t_keepalive, t_dormancy}
+                        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+
+                        for task in done:
+                            task_name = task.get_name()
+                            print(f"\n[main] Task '{task_name}' completed, triggering session transition...")
+                            try:
+                                exception = task.exception()
+                                if exception:
+                                    print(f"[main] ❌ Task '{task_name}' failed with exception:")
+                                    import traceback
+                                    traceback.print_exception(type(exception), exception, exception.__traceback__)
+                                    await logger.log_error(exception, context=f"main_task_{task_name}")
+                            except asyncio.CancelledError:
+                                print(f"[main] Task '{task_name}' was cancelled")
+                            except Exception as e:
+                                print(f"[main] Could not retrieve exception from task '{task_name}': {e}")
+
+                        if app_runtime.state == "ACTIVE":
+                            set_app_state(app_runtime, "ROTATING")
+                    finally:
+                        await session_router.close_current()
+                        session_router.clear()
+                        for task in pending:
+                            task.cancel()
+                        await asyncio.gather(*pending, return_exceptions=True)
             finally:
+                safe_print("\n[shutdown] Exiting HALfred...")
+                set_app_state(app_runtime, "SHUTTING_DOWN")
+                app_runtime.wake_event.set()
+                app_runtime.retry_event.set()
+                await session_router.close_current()
+                if t_stdin:
+                    t_stdin.cancel()
+                if t_mic:
+                    t_mic.cancel()
+                await asyncio.gather(*(t for t in (t_stdin, t_mic) if t is not None), return_exceptions=True)
+
                 # Close logger first to ensure all events are written
                 try:
                     await logger.close()

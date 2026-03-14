@@ -2,6 +2,7 @@
 .env
 MCP_SERVERS.json
 AGENTS.md
+.env_AG2.example
 
 # Python
 __pycache__/
