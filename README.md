@@ -1,41 +1,52 @@
 # Realtime HALfred
 
-A Python-based realtime voice assistant powered by OpenAI's Realtime API and ElevenLabs TTS. HALfred is a sardonic, sharp-tongued AI companion with personality, capable of natural voice conversations and equipped with screen monitoring capabilities through MCP integration.
+A Python-based realtime voice assistant powered by OpenAI's Realtime API, OpenAI Responses API, and ElevenLabs TTS. HALfred is a sardonic, sharp-tongued AI companion with personality, natural voice conversations, screen analysis, and optional desktop automation through MCP integration.
 
-> **Recent Updates:** v0.18 introduces a hierarchical agent architecture with a Supervisor agent for complex tasks. See [docs/SUPERVISOR.md](docs/SUPERVISOR.md) for details.
+> **Current architecture:** a low-latency Realtime "front desk" agent handles conversation and escalates tool-heavy work to a Supervisor agent. See [docs/SUPERVISOR.md](docs/SUPERVISOR.md) for details.
 
-## Complete environment setup:
-git clone --recursive https://github.com/edwardandrew-a11y/Realtime_HALfred.git                                                            
-python -m venv .venv                                                                      
-source .venv/bin/activate                                                                 
-pip install -r requirements.txt                                                           
-cd ScreenMonitorMCP && pip install -e . && cd ..                                          
+## Quick Start
+
+```bash
+git clone --recursive https://github.com/edwardandrew-a11y/Realtime_HALfred.git
+cd Realtime_HALfred
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+cd ScreenMonitorMCP
+pip install -e .
+cd ..
+cp .env.example .env
+# Optional: only needed if you plan to enable ENABLE_FEEDBACK_LOOP_MCP=true
 npm install
+python main.py
+```
 
 
 ## Overview
 
 Realtime HALfred uses:
-- **OpenAI Realtime API** (`gpt-realtime`) for low-latency voice interactions with native STT
-- **OpenAI Responses API** (Supervisor) for complex tasks with built-in tools (web search, code interpreter, image generation, file search)
+- **OpenAI Realtime API** (`gpt-realtime`) for low-latency voice I/O
+- **OpenAI Responses API** (Supervisor) for complex tasks with built-in tools (`web_search`, `code_interpreter`, `image_generation`, and optional `file_search`)
 - **ElevenLabs** for high-quality, natural text-to-speech output
 - **ScreenMonitorMCP** for AI vision and screen analysis capabilities
 - **PTY Terminal Access** for safe shell command execution with user confirmation
 - **MCP (Model Context Protocol)** for extensible tool integration
 - **Semantic VAD** for intelligent turn detection
-- **Whisper-1** for optional input audio transcription (debugging)
+- **Whisper-1** for microphone turn transcription
+- **AnkiConnect + Anki subagent** for Anki-specific tasks routed through the Supervisor
 
 ## Features
 
 - 🎙️ **Continuous Voice Interaction** - Toggle hands-free listening with `/mic` command
-- 🎤 **Push-to-Talk Mode** - Hold Command+Alt (or custom keys) to speak, release to send
+- 🎤 **Push-to-Talk Mode** - Hold your configured `PTT_KEY` combo or key to speak, release to send
 - 🛑 **Speech Interruption** - Interrupt HALfred mid-response with `/stop` or PTT activation
 - 🗣️ **Natural TTS** - ElevenLabs streaming audio for low-latency, natural speech
 - 🎭 **Personality-Driven** - Halfred has a distinct personality: sardonic, helpful, and unfiltered
 - 👁️ **Vision Capabilities** - Screen capture and AI-powered visual analysis through MCP
 - 💻 **Terminal Access** - Safe shell command execution with command-level safety controls
 - 🔧 **Extensible Tools** - MCP integration allows adding new capabilities easily
-- 🎧 **Half-Duplex Audio** - Automatic mic muting during playback to prevent echo
+- 🎧 **Half-Duplex Audio** - Mic capture stops while HALfred is responding and resumes automatically in continuous mode
 
 ## ⚠️ Important Notes
 
@@ -45,14 +56,11 @@ The following features have been extensively tested and are production-ready:
 - ✅ Screen monitoring (ScreenMonitorMCP)
 - ✅ PTY terminal access (pty-proxy-mcp)
 
-### Stable Desktop Automation
-The following desktop automation feature is now stable:
-- ✅ **Desktop Automation (macos-automator-mcp)** - Native macOS automation via AppleScript/JXA and accessibility APIs
-  - **Note:** Replaced Computer-Control-MCP due to limitations in image processing and significant latency issues
-
-### Experimental Features (Use with Caution)
-The following features are **experimental** and have not been fully tested:
-- ⚠️ **Feedback Loop UI (feedback-loop-mcp)** - Not fully tested across all macOS versions
+### Optional Desktop Automation (macOS only)
+- ✅ **`safe_action`** wraps `macos-automator-mcp` with mandatory confirmation
+- ⚠️ **`feedback-loop-mcp` overlays** are still experimental and only load when `ENABLE_FEEDBACK_LOOP_MCP=true`
+- ⚠️ **Target highlighting** is not yet implemented in `automation_safety.py`; the flow still uses screenshot + confirmation before actions
+- ℹ️ **Setup note:** the checked-in `MCP_SERVERS.json` contains a machine-specific `macos-automator` path, so update it before enabling `ENABLE_MACOS_AUTOMATOR_MCP=true`
 
 **Recommendations:**
 - Test automation features in a safe environment first
@@ -62,17 +70,30 @@ The following features are **experimental** and have not been fully tested:
 
 ## Available Tools
 
-### Built-in Tools
-- **`local_time`** - Returns the current local time (useful for sanity checks and time-aware responses)
+### Realtime Agent Tool
+- **`escalate_to_supervisor`** - The Realtime agent's only tool; hands off screen, web, code, automation, terminal, and other multi-step tasks to the Supervisor
+
+### Supervisor Built-in Tools
+- **`web_search`** - Current information via the Responses API
+- **`code_interpreter`** - Sandboxed Python execution
+- **`image_generation`** - Image generation
+- **`file_search`** - Optional RAG tool when `SUPERVISOR_VECTOR_STORE_ID` is configured
+
+### Supervisor Native Tools
+- **`local_time`** - Returns the current local time
+- **`screencapture`** - Captures a screenshot and saves it locally
+- **`safe_action`** - Optional macOS automation wrapper with confirmation
+- **`anki_agent`** - Routes Anki tasks through the Anki subagent / AnkiConnect integration
 
 ### MCP Tools (ScreenMonitorMCP)
-Halfred has access to the following visual and system monitoring tools:
+The ScreenMonitorMCP submodule provides screen-analysis, streaming, diagnostics, and memory tools. Common tools include:
 
-1. **`capture_screen`** - Take screenshots of any monitor
-2. **`analyze_screen`** - AI-powered screen content analysis and interpretation
-3. **`analyze_image`** - Analyze any image file with AI vision capabilities
-4. **`create_stream`** - Start live screen streaming for continuous monitoring
-5. **`get_performance_metrics`** - System health monitoring and performance metrics
+1. **`analyze_screen`** - AI-powered screen content analysis and interpretation
+2. **`detect_ui_elements`** - Identify UI elements on screen
+3. **`assess_system_performance`** - Assess visible performance signals
+4. **`create_stream` / `list_streams` / `get_stream_info`** - Manage live screen streams
+5. **`query_memory` / `get_memory_statistics`** - Inspect stored stream memory and diagnostics
+6. **`get_performance_metrics` / `get_system_status`** - Report system and server health
 
 These tools enable Halfred to:
 - See and describe what's on your screen
@@ -88,9 +109,10 @@ Halfred has safe terminal access through the PTY proxy:
 
 **Safety Features:**
 - **Safe commands** (pwd, ls, cat, grep, find, etc.) execute automatically without prompts
-- **Risky commands** (mkdir, rm, chmod, network ops) require user confirmation
+- **Risky commands** (mkdir, rm, chmod, network ops) require user confirmation when `PTY_REQUIRE_APPROVAL=true`
 - **Dangerous commands** (rm -rf, sudo, dd) show strong warnings before execution
 - Command parsing detects dangerous patterns (pipes to shell, output redirection, etc.)
+- Setting `PTY_REQUIRE_APPROVAL=false` keeps PTY enabled but removes the confirmation prompts
 
 **Safe Commands (Auto-Approved):**
 - Navigation: `pwd`, `cd`, `ls`, `tree`, `find`
@@ -109,31 +131,22 @@ Halfred has safe terminal access through the PTY proxy:
 - **Windows:** Uses `cmd.exe` for command execution
 - Safety controls work identically across all platforms
 
-### Native Screenshot Tool
+### Native Screenshot Tool (Supervisor)
 
-**`screencapture`** - Fast, native OS screenshot capture with Realtime API integration
+**`screencapture`** - Fast, native OS screenshot capture registered as a Supervisor native tool
 
-HALfred can see your screen using a native screenshot tool that:
+HALfred can use `screencapture` through the Supervisor to:
 - Captures screenshots using OS-native APIs (macOS `screencapture`, Windows/Linux PIL)
 - Saves images to `screenshots/` directory with timestamp filenames
-- Returns only metadata (path, dimensions) - no base64 in tool output
-- Automatically sends images to Realtime API as proper visual inputs
-- Works seamlessly across all platforms
+- Returns metadata JSON (path, filename, dimensions, timestamp)
+- Supports screenshot-taking and debug flows without embedding image bytes in tool output
 
-**Two-Phase Screenshot Flow:**
-1. **Tool Phase:** `screencapture` captures screen → saves to disk → returns metadata JSON
-2. **Upload Phase:** Handler reads image file → sends to Realtime as `input_image` message
-
-**Why this approach?**
-- ✅ Avoids string size limits (tool output stays small)
-- ✅ Efficient token usage (image sent as native multimodal input)
-- ✅ Fast native capture (no dependencies on macOS)
-- ✅ Agent receives actual image pixels, not text description
+For richer visual analysis, the Supervisor also has ScreenMonitorMCP tools such as `analyze_screen`.
 
 **Example Usage:**
 ```
-You> What's on my screen?
-HALfred> Let me take a look. [calls screencapture, receives image, describes what's visible]
+You> Save a screenshot of my current screen
+HALfred> [escalates to Supervisor → Supervisor calls screencapture → reports the saved path]
 ```
 
 **Platform Support:**
@@ -162,13 +175,12 @@ Halfred can control your computer with built-in safety confirmations:
 - **Click/Double-click** - Click at specific screen coordinates
 - **Type** - Type text into active window
 - **Hotkeys** - Execute keyboard shortcuts (cmd+c, ctrl+v, etc.)
-- **Window Control** - Focus and manage application windows
-- **Screen Info** - Query screen dimensions and window positions (read-only)
+- **Window Control** - Focus and activate applications by name
 
 **Safety Flow:**
 1. 📸 Takes a screenshot for context
-2. 🎯 Highlights the target region on screen
-3. ⏳ Requests confirmation via native overlay UI
+2. 🎯 Attempts a target preview; today this is a logged placeholder because visual highlighting is not implemented yet
+3. ⏳ Requests confirmation via feedback-loop overlay or terminal fallback
 4. ✅ Executes action only if approved
 
 **Example Usage:**
@@ -177,8 +189,8 @@ You> Click the Safari icon in my dock
 ```
 Halfred will:
 - Identify the Safari icon location
-- Show you a highlighted screenshot
-- Ask for confirmation via overlay
+- Take a screenshot for context
+- Ask for confirmation via overlay or terminal prompt
 - Click only if you approve
 
 **Implementation:**
@@ -188,7 +200,7 @@ Halfred will:
 **What automation_safety.py does:**
 - Provides a single `safe_action` tool that simplifies desktop automation
 - Enforces human-in-the-loop confirmation for all state-changing actions
-- Orchestrates the 4-step safety flow automatically (screenshot → highlight → confirm → execute)
+- Orchestrates the safety flow automatically (screenshot → preview/log target → confirm → execute)
 - Routes tool calls to macos-automator-mcp using AppleScript/JXA execution
 - Cannot be bypassed by the agent (enforced at the code level)
 
@@ -233,23 +245,27 @@ DEV_MODE=true  # Recommended for testing automation features
 # Install cliclick (required for mouse control)
 brew install cliclick
 
-# Ensure Node.js 18+ is installed (required for npx)
-node --version  # Should be 18.0.0 or higher
-# If not installed: brew install node
+# Install the optional feedback-loop dependency if you want overlay confirmations
+npm install
 
-# macos-automator-mcp will be automatically installed when first run via npx
+# Verify Node.js 16+ is available (package.json currently declares >=16.0.0)
+node --version
+
+# Before enabling ENABLE_MACOS_AUTOMATOR_MCP=true, update the macos-automator
+# command in MCP_SERVERS.json to point to your local macos-automator-mcp/start.sh
+
+# automation_safety.py currently invokes /opt/homebrew/bin/cliclick directly.
+# If Homebrew installs cliclick elsewhere, update that path in automation_safety.py
 
 # On macOS: Grant permissions in System Settings > Privacy & Security
 # - Accessibility (for UI automation)
 # - Automation (for controlling other applications)
-
-# On Windows: Grant permissions when prompted
 ```
 
 **Developer Commands** (enable with `DEV_MODE=true`):
 - `/screeninfo` - Display screen dimensions
-- `/screenshot [full|active]` - Capture screen
-- `/highlight x y w h` - Test highlight overlay
+- `/screenshot [full|active]` - Capture a debug screenshot (the current implementation always performs a full-screen capture)
+- `/highlight x y w h` - Exercise the highlight path; the current implementation logs the requested region instead of drawing it
 - `/confirm_test` - Test feedback loop UI
 - `/demo_click` - Full safety demo
 
@@ -377,9 +393,9 @@ USER_NAME=Your Name
 USER_CONTEXT=your occupation, interests, hobbies, etc.
 ```
 
-3. **Configure MCP servers (should work as-is):**
+3. **Review MCP server configuration:**
 
-The `MCP_SERVERS.json` file is already configured with relative paths and should work out of the box after installation:
+The checked-in `MCP_SERVERS.json` is enough for `screen-monitor`, `pty-proxy`, and the wrapped `feedback-loop` server once dependencies are installed. Its `macos-automator` entry points to a machine-specific absolute path, so update that command before you enable desktop automation.
 
 ```json
 [
@@ -410,8 +426,9 @@ The `MCP_SERVERS.json` file is already configured with relative paths and should
 **Notes:**
 - Uses `python` command (works with activated virtual environment)
 - Environment variables like `${OPENAI_API_KEY}` are automatically substituted from your `.env` file
-- PTY terminal access is enabled by default. To disable it, remove the `pty-proxy` entry or set `PTY_REQUIRE_APPROVAL=false` in `.env`
-- See `MCP_SERVERS.json.example` for additional configuration options
+- PTY terminal access is enabled by default. To disable it entirely, remove the `pty-proxy` entry from `MCP_SERVERS.json`
+- `PTY_REQUIRE_APPROVAL=false` does not disable PTY; it only disables confirmation prompts for risky shell commands
+- The checked-in file also includes optional `macos-automator` and `feedback-loop` entries; see `MCP_SERVERS.json.example` if you want a clean template
 
 ## Usage
 
@@ -454,11 +471,11 @@ When continuous listening is enabled:
 
 #### Push-to-Talk Mode (`/ptt`)
 When push-to-talk is enabled:
-- Hold **Command+Alt** keys (macOS) to record your voice
+- Hold your configured `PTT_KEY` combo or key to record your voice
 - Visual indicator shows when recording: `[ptt] >> RECORDING (keys held)`
 - Release keys to send your message to Halfred
 - Automatically interrupts Halfred's speech when you press the PTT keys
-- Can be customized via `PTT_KEY` in `.env` (options: `cmd_alt`, `space`, `ctrl`, `shift`, etc.)
+- Can be customized via `PTT_KEY` in `.env`; the shipped `.env.example` uses `cmd_alt_ctrl`, and single keys such as `space`, `ctrl`, `shift`, `alt`, or letters also work
 - If the Realtime websocket is dormant, pressing PTT wakes it and buffers your first utterance during reconnect
 
 **macOS Permissions Required:**
@@ -481,8 +498,8 @@ HALfred now keeps the app process alive even when the active Realtime websocket 
 
 HALfred uses a **two-tier agent architecture**:
 
-1. **Realtime Agent** - "Front desk" for fast, conversational interactions (screencapture only)
-2. **Supervisor Agent** - Handles complex tasks with full tool access
+1. **Realtime Agent** - "Front desk" for low-latency conversation and escalation; its only tool is `escalate_to_supervisor`
+2. **Supervisor Agent** - Handles screenshots, web search, code, Anki, terminal access, automation, and MCP tools
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -496,11 +513,13 @@ HALfred uses a **two-tier agent architecture**:
            │  Realtime    │    │   (Responses)    │
            │  "Front Desk"│    │   Complex Tasks  │
            │  - Voice I/O │    │   - Web Search   │
-           │  - Screenshot│    │   - Code Interp  │
-           │  - Simple Q&A│    │   - Image Gen    │
+           │  - Simple Q&A│    │   - Code Interp  │
+           │  - Escalation│    │   - Image Gen    │
            └──────────────┘    │   - File Search  │
+                    │          │   - Screenshots  │
                     │          │   - MCP Tools    │
                     │          │   - Automation   │
+                    │          │   - Anki         │
                     │          └──────────────────┘
                     │                   │
         ┌───────────┼───────────┐       │
@@ -524,10 +543,12 @@ HALfred uses a **two-tier agent architecture**:
 | User Request | Handled By | Reason |
 |--------------|------------|--------|
 | "Tell me a joke" | Realtime | Simple conversation |
-| "What time is it?" | Realtime | Basic Q&A |
+| "What time is it right now?" | Supervisor | Authoritative exact current time is available via `local_time` |
+| "What's on my screen?" | Supervisor | Requires screen tools |
 | "Search for AI news" | Supervisor | Requires web_search |
 | "Write Python code" | Supervisor | Requires code_interpreter |
 | "Generate an image" | Supervisor | Requires image_generation |
+| "Open Anki browser" | Supervisor | Uses `anki_agent` |
 | "Run a terminal command" | Supervisor | Requires MCP tools |
 
 See [docs/SUPERVISOR.md](docs/SUPERVISOR.md) for detailed architecture documentation.
@@ -542,7 +563,7 @@ See [docs/SUPERVISOR.md](docs/SUPERVISOR.md) for detailed architecture documenta
 
 ## Personality
 
-Halfred's personality is defined in `main.py:807-830`. Key traits:
+Halfred's personality is defined in the `instructions` prompt assembled in `main.py`. Key traits:
 - Refers to himself as "Halfred," never as an AI or assistant
 - Quick, clever, and darkly humorous
 - Casual, skeptical, and sometimes sarcastic
@@ -600,7 +621,7 @@ See `FIXES_CHEAT_SHEET.md` for detailed technical information about these fixes.
 ### No audio output
 - Check system audio output settings
 - Verify ElevenLabs API key is valid
-- Check if voice ID exists (default: Rachel)
+- Check if the configured voice ID exists (the shipped `.env.example` uses the voice labeled Rob)
 
 ### Microphone not working
 - Grant microphone permissions to Terminal/IDE
@@ -616,7 +637,7 @@ python -c "import sounddevice as sd; print(sd.query_devices())"
   - Add Terminal (or your IDE) to the allowed list
 - Verify pynput is installed: `pip install pynput`
 - Check that PTT is enabled: type `/ptt` in the console
-- Try a different key combination in `.env` if `cmd_alt` doesn't work
+- Try a different `PTT_KEY` in `.env` if your current combo does not register reliably
 - Check console for `[keyboard]` messages indicating key detection
 
 ### MCP tools not loading
@@ -626,9 +647,10 @@ python -c "import sounddevice as sd; print(sd.query_devices())"
 
 ### Automation features not working
 - Check that `ENABLE_MACOS_AUTOMATOR_MCP=true` in `.env`
-- Verify Node.js 18+ is installed: `node --version`
+- If you plan to use feedback-loop overlays, verify Node.js 16+ is installed: `node --version`
+- Update the `macos-automator` command in `MCP_SERVERS.json` so it points to your local `macos-automator-mcp/start.sh`
 - Install cliclick: `brew install cliclick`
-- Verify cliclick installation: `which cliclick` (should show `/opt/homebrew/bin/cliclick`)
+- If `which cliclick` does not resolve to `/opt/homebrew/bin/cliclick`, update the hardcoded path in `automation_safety.py`
 - Check system permissions: System Settings > Privacy & Security > Accessibility + Automation
 - Test with DEV_MODE commands first: `/demo_click`, `/screeninfo`
 - For issues, check MCP server logs in the terminal output
@@ -655,11 +677,11 @@ python -c "import sounddevice as sd; print(sd.query_devices())"
 |----------|----------|---------|-------------|
 | `OPENAI_API_KEY` | Yes | - | OpenAI API key for Realtime API |
 | `ELEVENLABS_API_KEY` | Yes | - | ElevenLabs API key for TTS |
-| `ELEVENLABS_VOICE_ID` | No | `2ajXGJNYBR0iNHpS4VZb` | Voice ID for ElevenLabs (default: Rachel) |
+| `ELEVENLABS_VOICE_ID` | No | `2ajXGJNYBR0iNHpS4VZb` | Voice ID for ElevenLabs (the shipped `.env.example` labels this voice as Rob) |
 | `USER_NAME` | No | `"the user"` | Your name for personalized interactions |
 | `USER_CONTEXT` | No | `""` | Your occupation, interests, hobbies (e.g., "a med student who likes D&D") |
 | `PTT_ENABLED` | No | `false` | Enable push-to-talk mode on startup |
-| `PTT_KEY` | No | `cmd_alt` | Keys for push-to-talk (`cmd_alt`, `space`, `ctrl`, `shift`, `alt`, or any letter) |
+| `PTT_KEY` | No | See `.env.example` | Push-to-talk key or modifier combo. The template uses `cmd_alt_ctrl`; if omitted entirely the runtime fallback is `cmd_alt` |
 | `PTT_INTERRUPTS_SPEECH` | No | `true` | Whether PTT activation interrupts HALfred's speech |
 | `DORMANT_TIMEOUT_MINUTES` | No | `30` | Minutes of inactivity before the Realtime websocket sleeps |
 | `SESSION_MAX_MINUTES` | No | `55` | Minutes before HALfred proactively rotates the Realtime session |
@@ -667,52 +689,50 @@ python -c "import sounddevice as sd; print(sd.query_devices())"
 | `MCP_CLIENT_TIMEOUT_SECONDS` | No | `30` | Timeout for MCP tool calls |
 | `MCP_DEMO_FILESYSTEM_DIR` | No | - | Optional demo filesystem MCP server |
 | `PTY_REQUIRE_APPROVAL` | No | `true` | Require user confirmation for risky shell commands |
-| `PTY_SAFE_COMMANDS` | No | See `.env.example` | Comma-separated list of safe commands |
-| `FILESYSTEM_REQUIRE_APPROVAL` | No | `true` | Require user confirmation for risky file operations |
 | `ENABLE_MACOS_AUTOMATOR_MCP` | No | `false` | Enable desktop automation features via macos-automator-mcp |
 | `ENABLE_FEEDBACK_LOOP_MCP` | No | `false` | Enable feedback loop confirmation UI (macOS only) |
-| `MACOS_AUTOMATOR_MCP_TIMEOUT` | No | `600` | Timeout for automation tool calls (seconds) |
 | `AUTOMATION_REQUIRE_APPROVAL` | No | `true` | Require confirmation for state-changing actions |
 | `PREFERRED_DISPLAY_INDEX` | No | `0` | For dual monitors: which display to use (0=primary) |
+| `SCREENSHOTS_DIR` | No | `screenshots` | Directory used by `screencapture` and debug screenshot helpers |
+| `OPENAI_AGENTS_DISABLE_TRACING` | No | `1` in `.env.example` | Disable OpenAI Agents SDK telemetry if you want local-only tracing behavior |
 | `DEV_MODE` | No | `false` | Enable developer debug commands |
 | `SUPERVISOR_MODEL` | No | `gpt-4.1` | Model for Supervisor agent (Responses API) |
 | `SUPERVISOR_VECTOR_STORE_ID` | No | - | Vector store ID for file_search RAG capability |
 
 ## Project Structure
 
+Key files and directories:
+
 ```
 Realtime_HALfred/
 ├── main.py                     # Main application entry point (Realtime agent)
 ├── supervisor.py               # Supervisor agent (Responses API for complex tasks)
-├── MCP_SERVERS.json            # MCP server configuration (uses relative paths)
-├── MCP_SERVERS.json.example    # Example MCP configuration
-├── .env                        # Environment variables (API keys) - create from .env.example
-├── .env.example                # Example environment file template
-├── pty_command_safety.py       # PTY command safety module
-├── pty_proxy_mcp.py            # PTY MCP proxy server (cross-platform)
-├── test_pty_safety.py          # PTY safety test suite
+├── anki_agent.py               # Anki subagent used by the Supervisor
+├── anki_connect.py             # Thin AnkiConnect client
+├── session_logger.py           # Session event logger
+├── mcp_schema_fix.py           # Patches MCP tool schemas for Realtime API compatibility
+├── native_screenshot.py        # Native screenshot tool exposed to the Supervisor
 ├── automation_safety.py        # Desktop automation safety wrapper
-├── test_automation_mcp.py      # Automation MCP smoke tests
-├── package.json                # Node.js dependencies (feedback-loop-mcp only)
-├── config.yaml                 # PTY MCP configuration
-├── requirements.txt            # Python dependencies with platform notes
-├── .gitignore                  # Git ignore rules
-├── .gitmodules                 # Git submodule configuration
+├── pty_proxy_mcp.py            # PTY MCP proxy server (cross-platform)
+├── pty_command_safety.py       # PTY command safety module
+├── MCP_SERVERS.json            # Checked-in MCP config; macos-automator entry is machine-specific
+├── MCP_SERVERS.json.example    # Example MCP configuration
+├── .env.example                # Example environment file template
 ├── README.md                   # This file
+├── FIXES_CHEAT_SHEET.md        # Notes on MCP and automation fixes
+├── package.json                # Node.js dependencies (feedback-loop-mcp only)
+├── requirements.txt            # Python dependencies with platform notes
+├── config.yaml                 # PTY MCP configuration
 ├── docs/
-│   ├── AUTOMATION.md           # Desktop automation user guide
+│   ├── SUPERVISOR.md           # Supervisor agent architecture documentation
+│   ├── AUTOMATION.md           # Automation notes
 │   ├── AUTOMATION_IMPLEMENTATION.md  # Technical implementation details
-│   ├── KNOWN_ISSUES.md         # Known issues and deferred fixes
-│   └── SUPERVISOR.md           # Supervisor agent architecture documentation
+│   └── KNOWN_ISSUES.md         # Known issues and deferred fixes
 ├── ScreenMonitorMCP/           # Screen monitoring MCP server (git submodule)
-├── data/                       # Data directory (logs, SQLite memory DB)
-├── node_modules/               # Node.js packages (feedback-loop-mcp)
-└── .venv/                      # Python virtual environment (not in git)
+├── logs/                       # Session logs written by session_logger.py
+├── screenshots/                # Saved screenshots from screencapture and debug helpers
+└── .venv/                      # Local virtual environment (created during setup)
 ```
-
-## License
-
-See LICENSE file for details.
 
 ## Credits
 

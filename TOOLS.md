@@ -2,8 +2,8 @@
 
 This document describes all tools available to the HALfred agents, organized by agent and source.
 
-**Last Updated:** 2026-01-22
-**Agent Version:** HALfred v0.18+
+**Last Updated:** 2026-04-01
+**Agent Version:** HALfred v1.20+
 
 ---
 
@@ -31,7 +31,7 @@ User Voice Input
        ▼
 ┌─────────────────────────────────────────────────────┐
 │            SUPERVISOR AGENT (Backend)               │
-│   Model: Configurable (GPT-4, etc.)                 │
+│   Model: Configurable (default: gpt-4.1)            │
 │   Tools: All native, built-in, MCP, and Anki tools  │
 └─────────────────────────────────────────────────────┘
 ```
@@ -43,7 +43,7 @@ User Voice Input
 | Agent | Tool Source | Tool Count | Description |
 |-------|-------------|------------|-------------|
 | **Realtime** | Native | 1 | `escalate_to_supervisor` only |
-| **Supervisor** | OpenAI Built-in | 4 | web_search, code_interpreter, image_generation, file_search |
+| **Supervisor** | OpenAI Built-in | 3-4 | web_search, code_interpreter, image_generation, and optional file_search |
 | **Supervisor** | Native Python | 4 | local_time, safe_action, screencapture, anki_agent |
 | **Supervisor** | ScreenMonitorMCP | 26 | Screen analysis, streaming, memory tools |
 | **Supervisor** | PTY Proxy MCP | 1 | Terminal command execution |
@@ -51,7 +51,7 @@ User Voice Input
 | **Supervisor** | Feedback Loop MCP | 1 | Human-in-the-loop confirmation |
 | **Anki Subagent** | Internal | 14 | Anki flashcard management (via anki_agent) |
 
-**Total Supervisor Tools:** ~39 (+ 14 internal Anki tools)
+**Total Supervisor Tools:** ~38-39 (+ 14 internal Anki tools)
 
 ---
 
@@ -60,7 +60,7 @@ User Voice Input
 - [Architecture Overview](#architecture-overview)
 - [Realtime Agent Tools](#realtime-agent-tools) (1 tool)
 - [Supervisor Agent Tools](#supervisor-agent-tools)
-  - [OpenAI Built-in Tools](#openai-built-in-tools) (4 tools)
+  - [OpenAI Built-in Tools](#openai-built-in-tools) (3-4 tools)
   - [Native Python Tools](#native-python-tools) (4 tools)
   - [ScreenMonitorMCP Tools](#screenmonitormcp-tools) (26 tools)
   - [PTY Proxy Tools](#pty-proxy-tools) (1 tool)
@@ -84,10 +84,12 @@ The Realtime agent acts as a "front desk" for voice interactions. It has **only 
 Route a complex task to the Supervisor agent for processing. The Realtime agent calls this when a request requires tools, multi-step planning, or capabilities beyond simple conversation.
 
 **Parameters:**
-- `task_description` (required, string): Description of what the user wants to accomplish
-- `context` (optional, string): Additional context from the conversation
+- `request` (required, string): The user's exact words/transcript to pass through to the Supervisor without paraphrasing
 
-**Returns:** The Supervisor's response (streamed to TTS)
+**Returns:** JSON containing:
+- `success` (boolean): Whether Supervisor handling succeeded
+- `supervisor_result` (string): The Supervisor's JSON result payload
+- `instructions` (string): Guidance for the Realtime agent to parse and narrate the result
 
 **When to Escalate:**
 - User needs any tool (screenshots, web search, code execution, MCP tools)
@@ -145,7 +147,7 @@ These tools are provided by OpenAI's Responses API and execute on OpenAI's infra
 
 **Description:** Search through uploaded documents using vector search.
 
-**Status:** Only available if `OPENAI_VECTOR_STORE_ID` is configured in `.env`
+**Status:** Only available if `SUPERVISOR_VECTOR_STORE_ID` is configured in `.env`
 
 **When to Use:**
 - RAG (Retrieval Augmented Generation) queries
@@ -179,8 +181,8 @@ Return the local time (useful as a tool-call sanity check).
 **Description:**
 Execute a desktop automation action with safety confirmation. This tool automatically handles the complete safety flow:
 1. Takes a screenshot for context
-2. Highlights the target region (if coordinates provided)
-3. Requests user confirmation via overlay UI
+2. Logs the intended target region when coordinates are provided (visual highlighting is not implemented yet)
+3. Requests user confirmation via feedback-loop overlay when enabled, otherwise falls back to terminal confirmation
 4. Executes the action only if approved
 
 **Parameters:**
@@ -374,7 +376,7 @@ See [Anki Subagent Tools](#anki-subagent-tools) for the 14 internal tools.
 
 ### Feedback Loop MCP Tools
 
-**Source:** `npx feedback-loop-mcp` (via wrapper)
+**Source:** `node feedback-loop-wrapper.js`
 **Status:** Enabled (requires `ENABLE_FEEDBACK_LOOP_MCP=true`)
 **Total:** 1 tool
 
@@ -502,7 +504,7 @@ The Realtime agent should escalate to Supervisor when:
 |----------|---------|---------|
 | `ENABLE_MACOS_AUTOMATOR_MCP` | Enable macOS automation tools | false |
 | `ENABLE_FEEDBACK_LOOP_MCP` | Enable feedback loop UI | false |
-| `OPENAI_VECTOR_STORE_ID` | Enable file_search tool | None |
+| `SUPERVISOR_VECTOR_STORE_ID` | Enable file_search tool | None |
 | `AUTOMATION_REQUIRE_APPROVAL` | Require confirmation for actions | true |
 
 ### MCP Servers Configuration
@@ -511,5 +513,5 @@ See `MCP_SERVERS.json` for MCP server definitions.
 
 ---
 
-**Last Updated:** 2026-01-22
-**Agent Version:** HALfred v0.18+
+**Last Updated:** 2026-04-01
+**Agent Version:** HALfred v1.20+
