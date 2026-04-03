@@ -435,7 +435,7 @@ These tools are **internal to the Anki subagent** and are accessed via the `anki
 
 | Tool | Description | Required Params |
 |------|-------------|-----------------|
-| `anki_gui_browse` | Open Anki's card browser with search | query |
+| `anki_gui_browse` | Open Anki's card browser; returns card count if a search query is given | None (query optional) |
 | `anki_gui_add_cards` | Open Add Cards dialog (empty or with preset values) | None (deck, model, fields optional) |
 | `anki_gui_current_card` | Get info about card currently being reviewed | None |
 | `anki_gui_deck_review` | Open a deck for review | deck |

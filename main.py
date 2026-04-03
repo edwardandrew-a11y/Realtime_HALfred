@@ -75,6 +75,14 @@ except ImportError as e:
 # This fixes tools like keyboard_type that use union schemas without top-level "type": "object"
 import mcp_schema_fix  # Applies monkey-patch on import
 
+from session_logger import (
+    get_global_logger,
+    log_span,
+    logging_context,
+    new_interaction_id,
+    new_trace_id,
+)
+
 # Import Supervisor agent for complex task handling
 from supervisor import SupervisorAgent, ContextManager, ConversationContext, SupervisorChunk
 
@@ -393,6 +401,8 @@ class ListenState:
     last_server_event_time: float = 0.0  # Timestamp of last event from server (for connection health)
     last_user_activity_time: float = 0.0  # Timestamp of last user activity (for dormancy)
     rotation_pending: bool = False  # Defer proactive rotation until the current turn is idle
+    current_trace_id: Optional[str] = None  # Correlates the active user turn across tasks
+    user_item_trace_ids: Dict[str, str] = field(default_factory=dict)  # Maps user item IDs to the trace that owns them
 
 
 @dataclass
@@ -1273,17 +1283,12 @@ async def escalate_to_supervisor(request: str) -> str:
     async with lock if lock else asyncio.Lock():
         safe_print(f"\n[escalation_tool] Routing to Supervisor: {request[:80]}...")
 
-        # Log the escalation call
-        from session_logger import get_global_logger
         agent_logger = get_global_logger()
         escalation_start_time = time.time()
-        if agent_logger:
-            await agent_logger.log_agent_call(
-                source_agent="realtime",
-                target_agent="supervisor",
-                request=request,
-                metadata={"user_name": os.getenv("USER_NAME", "User")}
-            )
+        trace_id = (listen_state.current_trace_id if listen_state else None) or new_trace_id()
+        interaction_id = new_interaction_id()
+        if listen_state:
+            listen_state.current_trace_id = trace_id
 
         # Stop mic during supervisor processing
         if mic and mic.running:
@@ -1295,36 +1300,29 @@ async def escalate_to_supervisor(request: str) -> str:
 
         accumulated_text = ""
         success = True
+        completion_metadata: dict = {}
 
         try:
-            async for chunk in supervisor.process(request, context):
-                if chunk.type == "text_delta":
-                    # Accumulate text (don't stream to TTS - let Realtime agent speak it)
-                    accumulated_text += chunk.content
-                    safe_print(chunk.content, end="", flush=True)
-
-                elif chunk.type == "tool_start":
-                    tool_name = chunk.content
-                    args = chunk.metadata.get("args", {}) if chunk.metadata else {}
-                    safe_print(f"\n[supervisor_tool] Starting: {tool_name}")
-
-                elif chunk.type == "tool_end":
-                    tool_name = chunk.content
-                    tool_success = chunk.metadata.get("success", False) if chunk.metadata else False
-                    status = "✓" if tool_success else "✗"
-                    safe_print(f"[supervisor_tool] {status} Completed: {tool_name}")
-
-                elif chunk.type == "complete":
-                    safe_print("\n[escalation_tool] Supervisor task complete")
-                    # Add to context for future turns
-                    if accumulated_text:
-                        context_manager.add_turn("assistant", accumulated_text)
-                    # Reset clarification count after successful escalation
-                    context_manager.reset_clarification()
-
-                elif chunk.type == "error":
-                    safe_print(f"\n[escalation_tool_error] {chunk.content}")
-                    success = False
+            with logging_context(trace_id=trace_id, interaction_id=interaction_id):
+                with log_span(trace_id=trace_id, interaction_id=interaction_id):
+                    if agent_logger:
+                        await agent_logger.log_agent_call(
+                            source_agent="realtime",
+                            target_agent="supervisor",
+                            request=request,
+                            metadata={
+                                "user_name": os.getenv("USER_NAME", "User"),
+                                "interaction_id": interaction_id,
+                            }
+                        )
+                    accumulated_text, success, completion_metadata = await _consume_supervisor_chunks(
+                        supervisor.process(request, context, interaction_id=interaction_id),
+                        context_manager=context_manager,
+                        tts=tts,
+                        stream_tts=False,
+                        task_complete_label="\n[escalation_tool] Supervisor task complete",
+                        error_label="[escalation_tool_error]",
+                    )
 
         except Exception as e:
             safe_print(f"\n[escalation_tool_error] Exception: {e}")
@@ -1340,13 +1338,20 @@ async def escalate_to_supervisor(request: str) -> str:
         # Log the supervisor response
         escalation_duration_ms = (time.time() - escalation_start_time) * 1000
         if agent_logger:
-            await agent_logger.log_agent_response(
-                source_agent="supervisor",
-                target_agent="realtime",
-                response=accumulated_text if accumulated_text else '{"status":"error","summary":"No response generated"}',
-                success=success,
-                duration_ms=escalation_duration_ms,
-            )
+            with logging_context(trace_id=trace_id, interaction_id=interaction_id):
+                await agent_logger.log_agent_response(
+                    source_agent="supervisor",
+                    target_agent="realtime",
+                    response=accumulated_text if accumulated_text else '{"status":"error","summary":"No response generated"}',
+                    transport_success=True,
+                    task_success=success,
+                    duration_ms=escalation_duration_ms,
+                    metadata={
+                        "interaction_id": interaction_id,
+                        "response_id": completion_metadata.get("response_id"),
+                        "rounds": completion_metadata.get("rounds"),
+                    },
+                )
 
         # The Supervisor returns JSON data. Pass it through for the Realtime agent to narrate.
         return json.dumps({
@@ -1614,6 +1619,7 @@ async def user_input_loop(
 
         # Text input still works for debugging.
         # Send plain text directly to the realtime session (agents/realtime.py) without audio.
+        listen_state.current_trace_id = new_trace_id()
         context_manager.add_turn("user", msg)
         ledger.add("user", msg)
         safe_print(f"[realtime_client] conversation.item.create (type: message, content: text)")
@@ -1917,6 +1923,60 @@ async def _handle_tool_call_with_screenshot(self, event, *, agent_snapshot=None)
 RealtimeSession._handle_tool_call = _handle_tool_call_with_screenshot  # type: ignore[attr-defined]
 
 
+async def _consume_supervisor_chunks(
+    chunk_stream,
+    *,
+    context_manager: ContextManager,
+    tts: Optional[ElevenLabsTTS],
+    stream_tts: bool,
+    task_complete_label: str,
+    error_label: str,
+) -> tuple[str, bool, dict]:
+    """Consume SupervisorChunk output consistently across both call paths."""
+    accumulated_text = ""
+    success = True
+    completion_metadata: dict = {}
+
+    async for chunk in chunk_stream:
+        if chunk.type == "text_delta":
+            accumulated_text += chunk.content
+            safe_print(chunk.content, end="", flush=True)
+            if stream_tts and tts and chunk.content:
+                tts.add_text(chunk.content)
+
+        elif chunk.type == "tool_start":
+            tool_name = chunk.content
+            args = chunk.metadata.get("args", {}) if chunk.metadata else {}
+            safe_print(f"\n[supervisor_tool] Starting: {tool_name} args={_truncate(str(args))}")
+
+        elif chunk.type == "tool_end":
+            tool_name = chunk.content
+            task_success = False
+            if chunk.metadata:
+                task_success = bool(chunk.metadata.get("task_success", chunk.metadata.get("success", False)))
+            status = "✓" if task_success else "✗"
+            safe_print(f"[supervisor_tool] {status} Completed: {tool_name}")
+
+        elif chunk.type == "reasoning":
+            safe_print(f"\n[reasoning] {chunk.content[:200]}...")
+
+        elif chunk.type == "complete":
+            completion_metadata = chunk.metadata or {}
+            safe_print(task_complete_label)
+            if accumulated_text:
+                context_manager.add_turn("assistant", accumulated_text)
+            context_manager.reset_clarification()
+
+        elif chunk.type == "error":
+            safe_print(f"\n{error_label} {chunk.content}")
+            success = False
+
+    if stream_tts and tts:
+        await tts.flush()
+
+    return accumulated_text, success, completion_metadata
+
+
 async def handle_supervisor_task(
     message: str,
     supervisor: SupervisorAgent,
@@ -1940,45 +2000,20 @@ async def handle_supervisor_task(
     user_name = os.getenv("USER_NAME", "User")
     context = context_manager.get_context(user_name=user_name)
 
-    accumulated_text = ""
-
     try:
-        async for chunk in supervisor.process(message, context):
-            if chunk.type == "text_delta":
-                # Stream text to console and TTS
-                accumulated_text += chunk.content
-                safe_print(chunk.content, end="", flush=True)
-                if tts and chunk.content:
-                    tts.add_text(chunk.content)
-
-            elif chunk.type == "tool_start":
-                tool_name = chunk.content
-                args = chunk.metadata.get("args", {}) if chunk.metadata else {}
-                safe_print(f"\n[supervisor_tool] Starting: {tool_name} args={_truncate(str(args))}")
-
-            elif chunk.type == "tool_end":
-                tool_name = chunk.content
-                success = chunk.metadata.get("success", False) if chunk.metadata else False
-                status = "✓" if success else "✗"
-                safe_print(f"[supervisor_tool] {status} Completed: {tool_name}")
-
-            elif chunk.type == "reasoning":
-                safe_print(f"\n[reasoning] {chunk.content[:200]}...")
-
-            elif chunk.type == "complete":
-                safe_print("\n[supervisor] Task complete")
-                # Add to context for future turns
-                if accumulated_text:
-                    context_manager.add_turn("assistant", accumulated_text)
-                # Reset clarification count after successful escalation
-                context_manager.reset_clarification()
-
-            elif chunk.type == "error":
-                safe_print(f"\n[supervisor_error] {chunk.content}")
-
-        # Flush TTS after processing
-        if tts:
-            await tts.flush()
+        trace_id = listen_state.current_trace_id or new_trace_id()
+        interaction_id = new_interaction_id()
+        listen_state.current_trace_id = trace_id
+        with logging_context(trace_id=trace_id, interaction_id=interaction_id):
+            with log_span(trace_id=trace_id, interaction_id=interaction_id):
+                await _consume_supervisor_chunks(
+                    supervisor.process(message, context, interaction_id=interaction_id),
+                    context_manager=context_manager,
+                    tts=tts,
+                    stream_tts=True,
+                    task_complete_label="\n[supervisor] Task complete",
+                    error_label="[supervisor_error]",
+                )
 
     except Exception as e:
         safe_print(f"\n[supervisor_error] Exception: {e}")
@@ -2029,6 +2064,7 @@ async def event_loop(
 
             # Reset turn state after response completes (ready for next turn)
             listen_state.turn_state = "idle"
+            listen_state.current_trace_id = None
 
             # Restart microphone after ElevenLabs finishes speaking; if continuous mode is ON
             if listen_state.enabled and not listen_state.ptt_mode and not mic.running and app_runtime.state == "ACTIVE":
@@ -2037,9 +2073,15 @@ async def event_loop(
 
         elif et == "tool_start":
             safe_print(f"[tool_start] {event.tool.name} args={_truncate(event.arguments)}")
+            if logger:
+                with logging_context(trace_id=listen_state.current_trace_id):
+                    await logger.log_tool_start(event)
 
         elif et == "tool_end":
             safe_print(f"[tool_end] {event.tool.name} output={_truncate(str(event.output))}")
+            if logger:
+                with logging_context(trace_id=listen_state.current_trace_id):
+                    await logger.log_tool_end(event)
 
             if event.tool.name == "screencapture":
                 # Screenshot flow is now handled in the custom tool handler to batch
@@ -2047,10 +2089,15 @@ async def event_loop(
                 safe_print("[screenshot] Tool end received (batched flow handled upstream)")
 
         elif et == "history_added":
-            # The session maintains conversation history; this fires often.
-            # Commented out to reduce log spam - uncomment for debugging
-            # safe_print(f"[history_added] item={_truncate(str(event.item))}")
-            pass
+            item = getattr(event, "item", None)
+            if logger and item and getattr(item, "role", None) == "user":
+                if not listen_state.current_trace_id:
+                    listen_state.current_trace_id = new_trace_id()
+                item_id = getattr(item, "item_id", None)
+                if item_id:
+                    listen_state.user_item_trace_ids[str(item_id)] = listen_state.current_trace_id
+                with logging_context(trace_id=listen_state.current_trace_id):
+                    await logger.log_message(item)
 
         elif et == "history_updated":
             # Full history snapshot; usually spammy.
@@ -2090,6 +2137,9 @@ async def event_loop(
                     delta = raw_evt.get("delta", "")
                     safe_print(delta, end="", flush=True)
                     ledger.append_assistant_delta(delta)
+                    if logger and listen_state.current_trace_id:
+                        with logging_context(trace_id=listen_state.current_trace_id):
+                            await logger.log_text_delta(delta)
                     # Send text to ElevenLabs for TTS
                     if tts and delta:
                         tts.add_text(delta)
@@ -2099,6 +2149,9 @@ async def event_loop(
                         context_manager.add_turn("assistant", assistant_text)
                     safe_print("")  # newline
                     safe_print(f"[realtime_event] response.output_text.done")
+                    if logger and listen_state.current_trace_id:
+                        with logging_context(trace_id=listen_state.current_trace_id):
+                            await logger.flush_text_buffer()
                     # Flush remaining text to ElevenLabs
                     if tts:
                         await tts.flush()
@@ -2106,8 +2159,20 @@ async def event_loop(
                 # Log transcription events and check for supervisor escalation
                 elif t == "conversation.item.input_audio_transcription.completed":
                     transcript = raw_evt.get("transcript", "")
+                    item_id = raw_evt.get("item_id")
+                    trace_id = None
+                    if item_id:
+                        trace_id = listen_state.user_item_trace_ids.get(str(item_id))
+                    if not trace_id:
+                        trace_id = listen_state.current_trace_id or new_trace_id()
+                    listen_state.current_trace_id = trace_id
+                    if item_id:
+                        listen_state.user_item_trace_ids[str(item_id)] = trace_id
                     safe_print(f"[transcription] \"{transcript}\"")
                     listen_state.last_user_activity_time = time.monotonic()
+                    if logger and transcript.strip():
+                        with logging_context(trace_id=trace_id):
+                            await logger.log_transcript(transcript)
 
                     # Track conversation context (escalation now handled via tool call)
                     if context_manager and transcript.strip():

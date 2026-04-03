@@ -13,6 +13,7 @@ Streams structured JSON responses back to the Realtime agent.
 """
 
 import asyncio
+import contextlib
 import inspect
 import time
 import json
@@ -26,6 +27,7 @@ from openai import AsyncOpenAI
 from agents.tool import FunctionTool
 from anki_agent import AnkiSubagent
 from mcp_schema_fix import fix_mcp_tool_schema
+from session_logger import get_global_logger, log_span, logging_context
 
 
 # -----------------------------
@@ -122,6 +124,7 @@ class ContextManager:
             old_turns = self.turns[:-self.max_turns]
             if not old_turns:
                 return
+            logger = get_global_logger()
 
             conversation_text = "\n".join(
                 f"{t['role'].upper()}: {t['content']}"
@@ -139,12 +142,37 @@ Conversation:
 
 Summary (2-3 sentences):"""
 
-            response = await self.client.responses.create(
-                model=self.summarize_model,
-                input=[{"role": "user", "content": prompt}],
-            )
+            with log_span():
+                if logger:
+                    await logger.log_llm_call(
+                        agent="context_manager",
+                        model=self.summarize_model,
+                        input_messages=[{"role": "user", "content": prompt}],
+                        tools=[],
+                        metadata={
+                            "event": "summarization",
+                            "turns_summarized": len(old_turns),
+                        },
+                    )
 
-            new_summary = response.output_text
+                summary_start = time.time()
+                response = await self.client.responses.create(
+                    model=self.summarize_model,
+                    input=[{"role": "user", "content": prompt}],
+                )
+
+                new_summary = response.output_text
+                if logger:
+                    await logger.log_llm_response(
+                        agent="context_manager",
+                        model=self.summarize_model,
+                        response_text=new_summary,
+                        duration_ms=(time.time() - summary_start) * 1000,
+                        metadata={
+                            "event": "summarization",
+                            "turns_summarized": len(old_turns),
+                        },
+                    )
 
             if self.summary:
                 self.summary = f"{self.summary}\n\nLater: {new_summary}"
@@ -389,10 +417,27 @@ Examples:
                 return server
         return None
 
+    @staticmethod
+    def _infer_task_success(result: Any) -> bool:
+        """Best-effort success inference for structured tool results."""
+        if isinstance(result, dict):
+            if result.get("success") is False:
+                return False
+            if result.get("status") == "error":
+                return False
+            if result.get("error"):
+                return False
+            return True
+        if isinstance(result, str):
+            try:
+                parsed = json.loads(result)
+            except Exception:
+                return True
+            return SupervisorAgent._infer_task_success(parsed)
+        return True
+
     async def _execute_tool(self, tool_name: str, args: dict) -> Any:
         """Execute a tool by name (native or MCP)."""
-        from session_logger import get_global_logger
-
         logger = get_global_logger()
         start_time = time.time()
 
@@ -423,12 +468,14 @@ Examples:
                         raise ValueError(f"MCP tool error: {result_text}")
                     # Log the response
                     duration_ms = (time.time() - start_time) * 1000
+                    task_success = self._infer_task_success(result_text)
                     if logger:
                         await logger.log_agent_response(
                             source_agent=tool_name,
                             target_agent="supervisor",
                             response=result_text,
-                            success=True,
+                            transport_success=True,
+                            task_success=task_success,
                             duration_ms=duration_ms,
                             metadata={"tool_type": "mcp"}
                         )
@@ -462,11 +509,13 @@ Examples:
                 duration_ms = (time.time() - start_time) * 1000
                 if logger:
                     result_str = json.dumps(result) if not isinstance(result, str) else result
+                    task_success = self._infer_task_success(result)
                     await logger.log_agent_response(
                         source_agent=tool_name,
                         target_agent="supervisor",
                         response=result_str,
-                        success=True,
+                        transport_success=True,
+                        task_success=task_success,
                         duration_ms=duration_ms,
                         metadata={"tool_type": "native"}
                     )
@@ -482,7 +531,8 @@ Examples:
                     source_agent=tool_name,
                     target_agent="supervisor",
                     response=str(e),
-                    success=False,
+                    transport_success=False,
+                    task_success=False,
                     duration_ms=duration_ms,
                     metadata={"error": str(e)}
                 )
@@ -492,6 +542,7 @@ Examples:
         self,
         message: str,
         context: ConversationContext,
+        interaction_id: Optional[str] = None,
     ) -> AsyncGenerator[SupervisorChunk, None]:
         """
         Process a complex task and stream results.
@@ -504,194 +555,245 @@ Examples:
             SupervisorChunk objects for streaming to Realtime agent
         """
         tools = await self._build_tools()
+        tool_names = [tool.get("name") or tool.get("type") or "unknown" for tool in tools]
+        logger = get_global_logger()
 
-        # Build input messages for initial request
         input_messages = context.to_messages()
         input_messages.append({"role": "user", "content": message})
 
-        max_rounds = 10  # Prevent infinite tool call loops
+        max_rounds = 10
         current_round = 0
         current_response_id = self.last_response_id
         next_input = input_messages
         is_initial = True
+        interaction_scope = (
+            logging_context(interaction_id=interaction_id)
+            if interaction_id is not None
+            else contextlib.nullcontext()
+        )
 
         try:
-            while current_round < max_rounds:
-                current_round += 1
-                print(f"[supervisor_debug] === Round {current_round} ===")
+            with interaction_scope:
+                while current_round < max_rounds:
+                    current_round += 1
+                    round_text_parts: List[str] = []
+                    round_tool_calls: List[Dict[str, Any]] = []
+                    round_start_time = time.time()
+                    print(f"[supervisor_debug] === Round {current_round} ===")
 
-                create_kwargs: Dict[str, Any] = {
-                    "model": self.model,
-                    "input": next_input,
-                    "tools": tools,
-                    "previous_response_id": current_response_id,
-                    "store": True,
-                    "stream": True,
-                }
-                if is_initial:
-                    create_kwargs["instructions"] = self.INSTRUCTIONS
-                    is_initial = False
-                response = await self.client.responses.create(**create_kwargs)
+                    with log_span(round_number=current_round, response_id=current_response_id):
+                        create_kwargs: Dict[str, Any] = {
+                            "model": self.model,
+                            "input": next_input,
+                            "tools": tools,
+                            "previous_response_id": current_response_id,
+                            "store": True,
+                            "stream": True,
+                        }
+                        if is_initial:
+                            create_kwargs["instructions"] = self.INSTRUCTIONS
+                            is_initial = False
 
-                # Collect function calls for this round
-                pending_function_calls = []  # List of (call_id, tool_name, result_str)
-                function_call_items = {}  # item_id -> {name, call_id}
-                got_text_output = False
-                stream_error = None
-
-                # Process streaming events (async iteration keeps event loop free)
-                async for event in response:
-                    event_type = getattr(event, 'type', None)
-
-                    # Debug: print events (skip noisy delta events)
-                    if event_type and "delta" not in event_type:
-                        print(f"[supervisor_debug] event_type={event_type}")
-
-                    if event_type == "response.output_text.delta":
-                        delta = getattr(event, 'delta', '')
-                        got_text_output = True
-                        yield SupervisorChunk(
-                            type="text_delta",
-                            content=delta
-                        )
-
-                    elif event_type == "response.output_item.added":
-                        # Track function call items when they're added
-                        item = getattr(event, 'item', None)
-                        if item:
-                            item_type = getattr(item, 'type', None)
-                            item_id = getattr(item, 'id', None)
-                            if item_type == "function_call" and item_id:
-                                name = getattr(item, 'name', '') or ''
-                                call_id = getattr(item, 'call_id', None)
-                                function_call_items[item_id] = {"name": name, "call_id": call_id}
-                                print(f"[supervisor_debug] Tracked function_call: {name} (id={item_id[:20]}...)")
-
-                    elif event_type == "response.function_call_arguments.done":
-                        # Tool call ready to execute
-                        item_id = getattr(event, 'item_id', None)
-
-                        # Get name/call_id from tracked item or event
-                        if item_id and item_id in function_call_items:
-                            tool_name = function_call_items[item_id].get("name", "")
-                            call_id = function_call_items[item_id].get("call_id")
-                        else:
-                            tool_name = getattr(event, 'name', '') or ''
-                            call_id = getattr(event, 'call_id', None)
-
-                        raw_args = getattr(event, 'arguments', '{}')
-                        try:
-                            args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                        except json.JSONDecodeError as e:
-                            error_text = f"Invalid tool arguments for {tool_name or 'unknown_tool'}: {e}"
-                            if call_id:
-                                yield SupervisorChunk(
-                                    type="tool_start",
-                                    content=tool_name or "unknown_tool",
-                                    metadata={"raw_args": raw_args}
-                                )
-                                yield SupervisorChunk(
-                                    type="tool_end",
-                                    content=tool_name or "unknown_tool",
-                                    metadata={"error": str(e), "success": False}
-                                )
-                                pending_function_calls.append((
-                                    call_id,
-                                    tool_name,
-                                    json.dumps({"error": error_text}),
-                                ))
-                                continue
-                            stream_error = error_text
-                            yield SupervisorChunk(
-                                type="error",
-                                content=error_text
+                        if logger:
+                            await logger.log_llm_call(
+                                agent="supervisor",
+                                model=self.model,
+                                input_messages=next_input,
+                                tools=tool_names,
+                                metadata={
+                                    "round": current_round,
+                                    "previous_response_id": current_response_id,
+                                },
                             )
-                            break
 
-                        yield SupervisorChunk(
-                            type="tool_start",
-                            content=tool_name,
-                            metadata={"args": args}
-                        )
+                        response = await self.client.responses.create(**create_kwargs)
 
-                        # Execute non-built-in tools
-                        if tool_name and ("__" in tool_name or self._find_native_tool(tool_name)):
-                            try:
-                                result = await self._execute_tool(tool_name, args)
-                                result_str = json.dumps(result) if not isinstance(result, str) else result
-                                yield SupervisorChunk(
-                                    type="tool_end",
-                                    content=tool_name,
-                                    metadata={"result": str(result)[:500], "success": True}
-                                )
-                                if call_id:
-                                    pending_function_calls.append((call_id, tool_name, result_str))
-                            except Exception as e:
-                                error_result = json.dumps({"error": str(e)})
-                                yield SupervisorChunk(
-                                    type="tool_end",
-                                    content=tool_name,
-                                    metadata={"error": str(e), "success": False}
-                                )
-                                if call_id:
-                                    pending_function_calls.append((call_id, tool_name, error_result))
+                        pending_function_calls = []
+                        function_call_items = {}
+                        got_text_output = False
+                        stream_error = None
 
-                    elif event_type == "response.reasoning_summary.done":
-                        summary = getattr(event, 'summary', '')
-                        yield SupervisorChunk(
-                            type="reasoning",
-                            content=summary
-                        )
+                        async for event in response:
+                            event_type = getattr(event, 'type', None)
+                            if event_type and "delta" not in event_type:
+                                print(f"[supervisor_debug] event_type={event_type}")
 
-                    elif event_type == "response.completed":
-                        resp_obj = getattr(event, 'response', None)
-                        if resp_obj:
-                            current_response_id = getattr(resp_obj, 'id', None)
+                            if event_type == "response.output_text.delta":
+                                delta = getattr(event, 'delta', '')
+                                got_text_output = True
+                                round_text_parts.append(delta)
+                                yield SupervisorChunk(type="text_delta", content=delta)
 
-                    elif event_type == "error":
-                        error = getattr(event, 'error', 'Unknown error')
-                        stream_error = str(error)
-                        yield SupervisorChunk(
-                            type="error",
-                            content=str(error)
-                        )
+                            elif event_type == "response.output_item.added":
+                                item = getattr(event, 'item', None)
+                                if item:
+                                    item_type = getattr(item, 'type', None)
+                                    item_id = getattr(item, 'id', None)
+                                    if item_type == "function_call" and item_id:
+                                        name = getattr(item, 'name', '') or ''
+                                        call_id = getattr(item, 'call_id', None)
+                                        function_call_items[item_id] = {"name": name, "call_id": call_id}
+                                        print(f"[supervisor_debug] Tracked function_call: {name} (id={item_id[:20]}...)")
+
+                            elif event_type == "response.function_call_arguments.done":
+                                item_id = getattr(event, 'item_id', None)
+                                if item_id and item_id in function_call_items:
+                                    tool_name = function_call_items[item_id].get("name", "")
+                                    call_id = function_call_items[item_id].get("call_id")
+                                else:
+                                    tool_name = getattr(event, 'name', '') or ''
+                                    call_id = getattr(event, 'call_id', None)
+
+                                raw_args = getattr(event, 'arguments', '{}')
+                                round_tool_calls.append({"name": tool_name, "call_id": call_id})
+                                try:
+                                    args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                                except json.JSONDecodeError as e:
+                                    error_text = f"Invalid tool arguments for {tool_name or 'unknown_tool'}: {e}"
+                                    if call_id:
+                                        with logging_context(tool_call_id=call_id):
+                                            yield SupervisorChunk(
+                                                type="tool_start",
+                                                content=tool_name or "unknown_tool",
+                                                metadata={"raw_args": raw_args}
+                                            )
+                                            yield SupervisorChunk(
+                                                type="tool_end",
+                                                content=tool_name or "unknown_tool",
+                                                metadata={
+                                                    "error": str(e),
+                                                    "success": False,
+                                                    "transport_success": False,
+                                                    "task_success": False,
+                                                    "tool_call_id": call_id,
+                                                }
+                                            )
+                                        pending_function_calls.append((
+                                            call_id,
+                                            tool_name,
+                                            json.dumps({"error": error_text}),
+                                        ))
+                                        continue
+                                    stream_error = error_text
+                                    yield SupervisorChunk(type="error", content=error_text)
+                                    break
+
+                                with logging_context(tool_call_id=call_id):
+                                    yield SupervisorChunk(
+                                        type="tool_start",
+                                        content=tool_name,
+                                        metadata={"args": args}
+                                    )
+
+                                    if tool_name and ("__" in tool_name or self._find_native_tool(tool_name)):
+                                        try:
+                                            with log_span(tool_call_id=call_id):
+                                                result = await self._execute_tool(tool_name, args)
+                                            result_str = json.dumps(result) if not isinstance(result, str) else result
+                                            task_success = self._infer_task_success(result)
+                                            yield SupervisorChunk(
+                                                type="tool_end",
+                                                content=tool_name,
+                                                metadata={
+                                                    "result": str(result)[:500],
+                                                    "success": task_success,
+                                                    "transport_success": True,
+                                                    "task_success": task_success,
+                                                    "tool_call_id": call_id,
+                                                }
+                                            )
+                                            if call_id:
+                                                pending_function_calls.append((call_id, tool_name, result_str))
+                                        except Exception as e:
+                                            error_result = json.dumps({"error": str(e)})
+                                            yield SupervisorChunk(
+                                                type="tool_end",
+                                                content=tool_name,
+                                                metadata={
+                                                    "error": str(e),
+                                                    "success": False,
+                                                    "transport_success": False,
+                                                    "task_success": False,
+                                                    "tool_call_id": call_id,
+                                                }
+                                            )
+                                            if call_id:
+                                                pending_function_calls.append((call_id, tool_name, error_result))
+
+                            elif event_type == "response.reasoning_summary.done":
+                                summary = getattr(event, 'summary', '')
+                                if isinstance(summary, list):
+                                    summary_text = " ".join(str(part) for part in summary)
+                                else:
+                                    summary_text = str(summary)
+                                if logger and summary_text:
+                                    await logger.log_reasoning(
+                                        agent="supervisor",
+                                        model=self.model,
+                                        summary=summary_text,
+                                        metadata={"round": current_round},
+                                    )
+                                yield SupervisorChunk(type="reasoning", content=summary_text)
+
+                            elif event_type == "response.completed":
+                                resp_obj = getattr(event, 'response', None)
+                                if resp_obj:
+                                    current_response_id = getattr(resp_obj, 'id', None)
+
+                            elif event_type == "error":
+                                error = getattr(event, 'error', 'Unknown error')
+                                stream_error = str(error)
+                                yield SupervisorChunk(type="error", content=str(error))
+                                break
+
+                        if logger:
+                            await logger.log_llm_response(
+                                agent="supervisor",
+                                model=self.model,
+                                response_text="".join(round_text_parts) if round_text_parts else None,
+                                tool_calls=round_tool_calls or None,
+                                duration_ms=(time.time() - round_start_time) * 1000,
+                                metadata={
+                                    "round": current_round,
+                                    "previous_response_id": create_kwargs["previous_response_id"],
+                                    "stream_error": stream_error,
+                                },
+                                response_id=current_response_id,
+                            )
+
+                        if stream_error:
+                            if logger:
+                                await logger.log_error(stream_error, context=f"supervisor_round_{current_round}")
+                            return
+
+                    print(f"[supervisor_debug] Round {current_round} done. pending_calls={len(pending_function_calls)}, got_text={got_text_output}")
+
+                    if got_text_output and not pending_function_calls:
+                        print("[supervisor_debug] Got text output, finishing")
                         break
 
-                if stream_error:
-                    return
+                    if not pending_function_calls:
+                        print("[supervisor_debug] No function calls and no text, breaking")
+                        break
 
-                print(f"[supervisor_debug] Round {current_round} done. pending_calls={len(pending_function_calls)}, got_text={got_text_output}")
+                    next_input = [
+                        {
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": result_str,
+                        }
+                        for call_id, _, result_str in pending_function_calls
+                    ]
+                    print(f"[supervisor_debug] Sending {len(next_input)} tool outputs for next round...")
 
-                # If we got text output and no pending calls, we're done
-                if got_text_output and not pending_function_calls:
-                    print("[supervisor_debug] Got text output, finishing")
-                    break
+                if current_response_id:
+                    self.last_response_id = current_response_id
 
-                # If no function calls and no text, something went wrong - break to avoid infinite loop
-                if not pending_function_calls:
-                    print("[supervisor_debug] No function calls and no text, breaking")
-                    break
-
-                # Prepare tool outputs for next round
-                next_input = [
-                    {
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": result_str,
-                    }
-                    for call_id, _, result_str in pending_function_calls
-                ]
-                print(f"[supervisor_debug] Sending {len(next_input)} tool outputs for next round...")
-
-            # Update last response ID
-            if current_response_id:
-                self.last_response_id = current_response_id
-
-            yield SupervisorChunk(
-                type="complete",
-                content="",
-                metadata={"response_id": self.last_response_id, "rounds": current_round}
-            )
+                yield SupervisorChunk(
+                    type="complete",
+                    content="",
+                    metadata={"response_id": self.last_response_id, "rounds": current_round}
+                )
 
         except Exception as e:
             yield SupervisorChunk(

@@ -6,6 +6,8 @@ with human-readable console output.
 """
 
 import asyncio
+import contextlib
+import contextvars
 import json
 import os
 import time
@@ -13,7 +15,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Iterator, List, Optional, Union
 from enum import Enum
 
 
@@ -25,6 +27,114 @@ class LogLevel(str, Enum):
     ERROR = "error"
 
 
+_MISSING = object()
+_FULL_PAYLOADS = os.getenv("LOG_FULL_PAYLOADS", "false").lower() == "true"
+_VERBOSE_DELTAS = os.getenv("LOG_VERBOSE_DELTAS", "false").lower() == "true"
+
+_trace_id_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("trace_id", default=None)
+_interaction_id_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("interaction_id", default=None)
+_span_stack_var: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar("span_stack", default=())
+_round_var: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar("round", default=None)
+_response_id_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("response_id", default=None)
+_tool_call_id_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("tool_call_id", default=None)
+
+
+def new_trace_id() -> str:
+    return f"trace_{uuid.uuid4().hex}"
+
+
+def new_interaction_id() -> str:
+    return f"interaction_{uuid.uuid4().hex}"
+
+
+def _cap(text: Optional[str], default_limit: int = 1000) -> Optional[str]:
+    if text is None:
+        return None
+    if _FULL_PAYLOADS or len(text) <= default_limit:
+        return text
+    return text[:default_limit] + "..."
+
+
+def _serialize_preview(value: Any, default_limit: int = 1000) -> str:
+    try:
+        if isinstance(value, str):
+            return _cap(value, default_limit) or ""
+        return _cap(json.dumps(value, default=str), default_limit) or ""
+    except Exception:
+        return _cap(str(value), default_limit) or ""
+
+
+def get_correlation_context() -> Dict[str, Any]:
+    span_stack = _span_stack_var.get()
+    return {
+        "trace_id": _trace_id_var.get(),
+        "interaction_id": _interaction_id_var.get(),
+        "span_id": str(uuid.uuid4()),
+        "parent_span_id": span_stack[-1] if span_stack else None,
+        "round": _round_var.get(),
+        "response_id": _response_id_var.get(),
+        "tool_call_id": _tool_call_id_var.get(),
+    }
+
+
+@contextlib.contextmanager
+def logging_context(
+    *,
+    trace_id: Any = _MISSING,
+    interaction_id: Any = _MISSING,
+    round_number: Any = _MISSING,
+    response_id: Any = _MISSING,
+    tool_call_id: Any = _MISSING,
+) -> Iterator[None]:
+    tokens: List[tuple[contextvars.ContextVar[Any], contextvars.Token[Any]]] = []
+    try:
+        if trace_id is not _MISSING:
+            tokens.append((_trace_id_var, _trace_id_var.set(trace_id)))
+        if interaction_id is not _MISSING:
+            tokens.append((_interaction_id_var, _interaction_id_var.set(interaction_id)))
+        if round_number is not _MISSING:
+            tokens.append((_round_var, _round_var.set(round_number)))
+        if response_id is not _MISSING:
+            tokens.append((_response_id_var, _response_id_var.set(response_id)))
+        if tool_call_id is not _MISSING:
+            tokens.append((_tool_call_id_var, _tool_call_id_var.set(tool_call_id)))
+        yield
+    finally:
+        for var, token in reversed(tokens):
+            var.reset(token)
+
+
+@contextlib.contextmanager
+def log_span(
+    *,
+    trace_id: Any = _MISSING,
+    interaction_id: Any = _MISSING,
+    round_number: Any = _MISSING,
+    response_id: Any = _MISSING,
+    tool_call_id: Any = _MISSING,
+) -> Iterator[str]:
+    span_id = str(uuid.uuid4())
+    span_stack = _span_stack_var.get()
+    tokens: List[tuple[contextvars.ContextVar[Any], contextvars.Token[Any]]] = [
+        (_span_stack_var, _span_stack_var.set(span_stack + (span_id,))),
+    ]
+    try:
+        if trace_id is not _MISSING:
+            tokens.append((_trace_id_var, _trace_id_var.set(trace_id)))
+        if interaction_id is not _MISSING:
+            tokens.append((_interaction_id_var, _interaction_id_var.set(interaction_id)))
+        if round_number is not _MISSING:
+            tokens.append((_round_var, _round_var.set(round_number)))
+        if response_id is not _MISSING:
+            tokens.append((_response_id_var, _response_id_var.set(response_id)))
+        if tool_call_id is not _MISSING:
+            tokens.append((_tool_call_id_var, _tool_call_id_var.set(tool_call_id)))
+        yield span_id
+    finally:
+        for var, token in reversed(tokens):
+            var.reset(token)
+
+
 @dataclass
 class LogEntry:
     """Base structure for all log entries."""
@@ -33,6 +143,13 @@ class LogEntry:
     event_type: str
     level: LogLevel
     data: Dict[str, Any]
+    trace_id: Optional[str] = None
+    interaction_id: Optional[str] = None
+    span_id: Optional[str] = None
+    parent_span_id: Optional[str] = None
+    round: Optional[int] = None
+    response_id: Optional[str] = None
+    tool_call_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -42,6 +159,13 @@ class LogEntry:
             "timestamp_iso": datetime.fromtimestamp(self.timestamp).isoformat(),
             "event_type": self.event_type,
             "level": self.level.value,
+            "trace_id": self.trace_id,
+            "interaction_id": self.interaction_id,
+            "span_id": self.span_id,
+            "parent_span_id": self.parent_span_id,
+            "round": self.round,
+            "response_id": self.response_id,
+            "tool_call_id": self.tool_call_id,
             "data": self.data
         }
 
@@ -119,6 +243,36 @@ class SessionLogger:
         # Session state
         self.session_start_time = time.time()
         self.events: List[Dict[str, Any]] = []
+
+    def _make_entry(
+        self,
+        event_type: str,
+        level: LogLevel,
+        data: Dict[str, Any],
+        *,
+        trace_id: Any = _MISSING,
+        interaction_id: Any = _MISSING,
+        span_id: Any = _MISSING,
+        parent_span_id: Any = _MISSING,
+        round_number: Any = _MISSING,
+        response_id: Any = _MISSING,
+        tool_call_id: Any = _MISSING,
+    ) -> LogEntry:
+        correlation = get_correlation_context()
+        return LogEntry(
+            session_id=self.session_id,
+            timestamp=time.time(),
+            event_type=event_type,
+            level=level,
+            data=data,
+            trace_id=correlation["trace_id"] if trace_id is _MISSING else trace_id,
+            interaction_id=correlation["interaction_id"] if interaction_id is _MISSING else interaction_id,
+            span_id=correlation["span_id"] if span_id is _MISSING else span_id,
+            parent_span_id=correlation["parent_span_id"] if parent_span_id is _MISSING else parent_span_id,
+            round=correlation["round"] if round_number is _MISSING else round_number,
+            response_id=correlation["response_id"] if response_id is _MISSING else response_id,
+            tool_call_id=correlation["tool_call_id"] if tool_call_id is _MISSING else tool_call_id,
+        )
 
     @classmethod
     async def create(
@@ -255,6 +409,10 @@ class SessionLogger:
             duration = entry.data.get('duration_seconds', 0)
             print(f"[{timestamp}] ASSISTANT TEXT COMPLETE: {char_count} chars in {duration:.2f}s")
 
+        elif entry.event_type == "user_transcript":
+            content_preview = entry.data.get('content_text', '')[:100]
+            print(f"[{timestamp}] TRANSCRIPT: {content_preview}")
+
         elif entry.event_type == "tool_start":
             tool_name = entry.data.get('tool_name')
             print(f"[{timestamp}] TOOL START: {tool_name}")
@@ -270,6 +428,17 @@ class SessionLogger:
             error_msg = entry.data.get('error', 'Unknown error')
             print(f"[{timestamp}] ERROR: {error_msg}")
 
+        elif entry.event_type == "agent_call":
+            print(f"[{timestamp}] {entry.data.get('source', '?')} -> {entry.data.get('target', '?')}")
+
+        elif entry.event_type == "agent_response":
+            status = "✓" if entry.data.get('task_success', entry.data.get('success', True)) else "✗"
+            print(f"[{timestamp}] {entry.data.get('source', '?')} -> {entry.data.get('target', '?')} {status}")
+
+        elif entry.event_type == "reasoning_summary":
+            summary = entry.data.get('summary', '')[:100]
+            print(f"[{timestamp}] REASONING: {summary}")
+
     async def _enqueue(self, entry: LogEntry):
         """Add log entry to async queue."""
         try:
@@ -280,9 +449,7 @@ class SessionLogger:
 
     async def log_session_start(self):
         """Log session initialization."""
-        entry = LogEntry(
-            session_id=self.session_id,
-            timestamp=time.time(),
+        entry = self._make_entry(
             event_type="session_start",
             level=LogLevel.INFO,
             data={
@@ -304,21 +471,22 @@ class SessionLogger:
         tool_key = f"{event.tool.name}_{time.time()}"
         self.tool_start_times[tool_key] = time.time()
 
-        entry = LogEntry(
-            session_id=self.session_id,
-            timestamp=time.time(),
+        entry = self._make_entry(
             event_type="tool_start",
             level=LogLevel.INFO,
             data={
                 "tool_name": event.tool.name,
                 "agent_name": event.agent.name,
                 "arguments": event.arguments,  # Full JSON string, no truncation
+                "transport_success": True,
+                "task_success": None,
                 "usage": {
                     "input_tokens": event.info.context.usage.input_tokens,
                     "output_tokens": event.info.context.usage.output_tokens,
                     "total_tokens": event.info.context.usage.total_tokens,
                 }
-            }
+            },
+            tool_call_id=getattr(event, "call_id", None),
         )
         await self._enqueue(entry)
 
@@ -338,24 +506,26 @@ class SessionLogger:
             start_time = self.tool_start_times.pop(latest_key)
             duration_ms = (time.time() - start_time) * 1000
 
-        entry = LogEntry(
-            session_id=self.session_id,
-            timestamp=time.time(),
+        output_text = str(event.output)
+        entry = self._make_entry(
             event_type="tool_end",
             level=LogLevel.INFO,
             data={
                 "tool_name": event.tool.name,
                 "agent_name": event.agent.name,
                 "arguments": event.arguments,
-                "output": str(event.output),  # Full output, no truncation
+                "output": output_text,
                 "success": True,  # Assume success if no exception
+                "transport_success": True,
+                "task_success": True,
                 "duration_ms": duration_ms,
                 "usage": {
                     "input_tokens": event.info.context.usage.input_tokens,
                     "output_tokens": event.info.context.usage.output_tokens,
                     "total_tokens": event.info.context.usage.total_tokens,
                 }
-            }
+            },
+            tool_call_id=getattr(event, "call_id", None),
         )
         await self._enqueue(entry)
 
@@ -383,13 +553,11 @@ class SessionLogger:
                 elif content.type == "input_image":
                     content_text += "[Image]"
 
-            entry = LogEntry(
-                session_id=self.session_id,
-                timestamp=time.time(),
+            entry = self._make_entry(
                 event_type="user_message",
                 level=LogLevel.INFO,
                 data={
-                    "item_id": item.item_id,
+                    "item_id": getattr(item, "item_id", None),
                     "role": "user",
                     "content_types": content_types,
                     "content_text": content_text,
@@ -402,16 +570,14 @@ class SessionLogger:
                 if content.type == "text":
                     content_text += content.text or ""
 
-            entry = LogEntry(
-                session_id=self.session_id,
-                timestamp=time.time(),
+            entry = self._make_entry(
                 event_type="assistant_message",
                 level=LogLevel.INFO,
                 data={
-                    "item_id": item.item_id,
+                    "item_id": getattr(item, "item_id", None),
                     "role": "assistant",
                     "content": content_text,
-                    "status": item.status,
+                    "status": getattr(item, "status", None),
                 }
             )
 
@@ -429,6 +595,13 @@ class SessionLogger:
         if not self.text_start_time:
             self.text_start_time = time.time()
         self.text_buffer.append(delta)
+        if _VERBOSE_DELTAS:
+            entry = self._make_entry(
+                event_type="assistant_text_delta",
+                level=LogLevel.DEBUG,
+                data={"delta": delta, "char_count": len(delta)},
+            )
+            await self._enqueue(entry)
 
     async def flush_text_buffer(self):
         """
@@ -442,9 +615,7 @@ class SessionLogger:
         complete_text = "".join(self.text_buffer)
         duration = time.time() - (self.text_start_time or time.time())
 
-        entry = LogEntry(
-            session_id=self.session_id,
-            timestamp=time.time(),
+        entry = self._make_entry(
             event_type="assistant_text_complete",
             level=LogLevel.INFO,
             data={
@@ -459,6 +630,39 @@ class SessionLogger:
         self.text_buffer.clear()
         self.text_start_time = None
 
+    async def log_transcript(self, text: str, source: str = "audio_transcription"):
+        """Log a user transcript as soon as it is available."""
+        entry = self._make_entry(
+            event_type="user_transcript",
+            level=LogLevel.INFO,
+            data={
+                "content_text": text,
+                "source": source,
+            }
+        )
+        await self._enqueue(entry)
+
+    async def log_reasoning(
+        self,
+        agent: str,
+        summary: str,
+        model: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
+        """Log surfaced reasoning summaries."""
+        entry = self._make_entry(
+            event_type="reasoning_summary",
+            level=LogLevel.INFO,
+            data={
+                "agent": agent,
+                "model": model,
+                "summary": _cap(summary, 2000),
+                "summary_length": len(summary or ""),
+                "metadata": metadata or {},
+            }
+        )
+        await self._enqueue(entry)
+
     async def log_error(self, error: Any, context: Optional[str] = None):
         """
         Log an error event.
@@ -467,9 +671,7 @@ class SessionLogger:
             error: Error object or message
             context: Optional context about where error occurred
         """
-        entry = LogEntry(
-            session_id=self.session_id,
-            timestamp=time.time(),
+        entry = self._make_entry(
             event_type="error",
             level=LogLevel.ERROR,
             data={
@@ -489,9 +691,7 @@ class SessionLogger:
         await self.flush_text_buffer()
 
         # Log session end
-        entry = LogEntry(
-            session_id=self.session_id,
-            timestamp=time.time(),
+        entry = self._make_entry(
             event_type="session_end",
             level=LogLevel.INFO,
             data={
@@ -583,9 +783,7 @@ class SessionLogger:
             request: The request/task being sent
             metadata: Optional additional context
         """
-        entry = LogEntry(
-            session_id=self.session_id,
-            timestamp=time.time(),
+        entry = self._make_entry(
             event_type="agent_call",
             level=LogLevel.INFO,
             data={
@@ -602,7 +800,9 @@ class SessionLogger:
         source_agent: str,
         target_agent: str,
         response: str,
-        success: bool = True,
+        success: Optional[bool] = None,
+        transport_success: Optional[bool] = None,
+        task_success: Optional[bool] = None,
         duration_ms: Optional[float] = None,
         metadata: Optional[Dict[str, Any]] = None
     ):
@@ -617,20 +817,27 @@ class SessionLogger:
             duration_ms: Time taken for the operation
             metadata: Optional additional context
         """
-        # Truncate very long responses for logging
-        response_preview = response[:2000] + "..." if len(response) > 2000 else response
+        if transport_success is None:
+            transport_success = True if success is None else success
+        if task_success is None:
+            task_success = transport_success if success is None else success
 
-        entry = LogEntry(
-            session_id=self.session_id,
-            timestamp=time.time(),
+        # Determine level before capping so that full error text is preserved.
+        level = LogLevel.INFO if transport_success and task_success is not False else LogLevel.ERROR
+        # For errors, store full text (enables --level full recovery). For success, cap to 2000.
+        response_preview = response if level == LogLevel.ERROR else (_cap(response, 2000) or "")
+
+        entry = self._make_entry(
             event_type="agent_response",
-            level=LogLevel.INFO if success else LogLevel.ERROR,
+            level=level,
             data={
                 "source": source_agent,
                 "target": target_agent,
                 "response": response_preview,
                 "response_length": len(response),
-                "success": success,
+                "success": task_success,
+                "transport_success": transport_success,
+                "task_success": task_success,
                 "duration_ms": duration_ms,
                 "metadata": metadata or {},
             }
@@ -655,18 +862,9 @@ class SessionLogger:
             tools: List of tool names available
             metadata: Optional additional context
         """
-        # Serialize input messages for logging
-        try:
-            if isinstance(input_messages, list):
-                messages_preview = json.dumps(input_messages, default=str)[:1000]
-            else:
-                messages_preview = str(input_messages)[:1000]
-        except Exception:
-            messages_preview = str(input_messages)[:1000]
+        messages_preview = _serialize_preview(input_messages, 1000)
 
-        entry = LogEntry(
-            session_id=self.session_id,
-            timestamp=time.time(),
+        entry = self._make_entry(
             event_type="llm_call",
             level=LogLevel.INFO,
             data={
@@ -674,6 +872,7 @@ class SessionLogger:
                 "model": model,
                 "input_preview": messages_preview,
                 "tools": tools or [],
+                "transport_success": True,
                 "metadata": metadata or {},
             }
         )
@@ -687,7 +886,9 @@ class SessionLogger:
         tool_calls: Optional[List[Dict[str, Any]]] = None,
         duration_ms: Optional[float] = None,
         usage: Optional[Dict[str, int]] = None,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        reasoning_summary: Optional[str] = None,
+        response_id: Optional[str] = None,
     ):
         """
         Log an LLM response.
@@ -701,13 +902,9 @@ class SessionLogger:
             usage: Token usage info
             metadata: Optional additional context
         """
-        response_preview = None
-        if response_text:
-            response_preview = response_text[:1000] + "..." if len(response_text) > 1000 else response_text
+        response_preview = _cap(response_text, 1000) if response_text else None
 
-        entry = LogEntry(
-            session_id=self.session_id,
-            timestamp=time.time(),
+        entry = self._make_entry(
             event_type="llm_response",
             level=LogLevel.INFO,
             data={
@@ -717,9 +914,12 @@ class SessionLogger:
                 "response_length": len(response_text) if response_text else 0,
                 "tool_calls": tool_calls or [],
                 "duration_ms": duration_ms,
+                "reasoning_summary": _cap(reasoning_summary, 2000),
+                "transport_success": True,
                 "usage": usage or {},
                 "metadata": metadata or {},
-            }
+            },
+            response_id=response_id,
         )
         await self._enqueue(entry)
 
@@ -743,16 +943,9 @@ class SessionLogger:
             success: Whether the tool call succeeded
             duration_ms: Time taken
         """
-        # Serialize result for logging
-        try:
-            result_str = json.dumps(result, default=str)
-            result_preview = result_str[:1000] + "..." if len(result_str) > 1000 else result_str
-        except Exception:
-            result_preview = str(result)[:1000]
+        result_preview = _serialize_preview(result, 1000)
 
-        entry = LogEntry(
-            session_id=self.session_id,
-            timestamp=time.time(),
+        entry = self._make_entry(
             event_type="subagent_tool_dispatch",
             level=LogLevel.INFO if success else LogLevel.ERROR,
             data={
@@ -761,6 +954,8 @@ class SessionLogger:
                 "arguments": arguments,
                 "result_preview": result_preview,
                 "success": success,
+                "transport_success": True,
+                "task_success": success,
                 "duration_ms": duration_ms,
             }
         )
@@ -792,10 +987,20 @@ async def log_agent_call(source: str, target: str, request: str, metadata: Optio
 
 
 async def log_agent_response(source: str, target: str, response: str, success: bool = True,
-                             duration_ms: Optional[float] = None, metadata: Optional[Dict[str, Any]] = None):
+                             duration_ms: Optional[float] = None, metadata: Optional[Dict[str, Any]] = None,
+                             transport_success: Optional[bool] = None, task_success: Optional[bool] = None):
     """Convenience function for logging agent responses."""
     if _global_logger:
-        await _global_logger.log_agent_response(source, target, response, success, duration_ms, metadata)
+        await _global_logger.log_agent_response(
+            source,
+            target,
+            response,
+            success=success,
+            transport_success=transport_success,
+            task_success=task_success,
+            duration_ms=duration_ms,
+            metadata=metadata,
+        )
 
 
 # -------------------------
@@ -812,16 +1017,25 @@ def log_sync(event_type: str, level: LogLevel, data: Dict[str, Any]):
     if not _global_logger or not _global_logger._jsonl_file:
         return
 
+    correlation = get_correlation_context()
     entry = {
         "session_id": _global_logger.session_id,
         "timestamp": time.time(),
         "timestamp_iso": datetime.fromtimestamp(time.time()).isoformat(),
         "event_type": event_type,
         "level": level.value,
+        "trace_id": correlation["trace_id"],
+        "interaction_id": correlation["interaction_id"],
+        "span_id": correlation["span_id"],
+        "parent_span_id": correlation["parent_span_id"],
+        "round": correlation["round"],
+        "response_id": correlation["response_id"],
+        "tool_call_id": correlation["tool_call_id"],
         "data": data
     }
 
     try:
+        _global_logger.events.append(entry)
         _global_logger._jsonl_file.write(json.dumps(entry) + '\n')
         _global_logger._jsonl_file.flush()
     except Exception as e:
@@ -836,19 +1050,14 @@ def log_llm_call_sync(
     metadata: Optional[Dict[str, Any]] = None
 ):
     """Synchronous version of log_llm_call for threaded code."""
-    try:
-        if isinstance(input_messages, list):
-            messages_preview = json.dumps(input_messages, default=str)[:1000]
-        else:
-            messages_preview = str(input_messages)[:1000]
-    except Exception:
-        messages_preview = str(input_messages)[:1000]
+    messages_preview = _serialize_preview(input_messages, 1000)
 
     log_sync("llm_call", LogLevel.INFO, {
         "agent": agent,
         "model": model,
         "input_preview": messages_preview,
         "tools": tools or [],
+        "transport_success": True,
         "metadata": metadata or {},
     })
 
@@ -863,9 +1072,7 @@ def log_llm_response_sync(
     metadata: Optional[Dict[str, Any]] = None
 ):
     """Synchronous version of log_llm_response for threaded code."""
-    response_preview = None
-    if response_text:
-        response_preview = response_text[:1000] + "..." if len(response_text) > 1000 else response_text
+    response_preview = _cap(response_text, 1000) if response_text else None
 
     log_sync("llm_response", LogLevel.INFO, {
         "agent": agent,
@@ -874,6 +1081,7 @@ def log_llm_response_sync(
         "response_length": len(response_text) if response_text else 0,
         "tool_calls": tool_calls or [],
         "duration_ms": duration_ms,
+        "transport_success": True,
         "usage": usage or {},
         "metadata": metadata or {},
     })
@@ -888,11 +1096,7 @@ def log_tool_dispatch_sync(
     duration_ms: Optional[float] = None
 ):
     """Synchronous logging for tool dispatches (e.g., AnkiConnect calls)."""
-    try:
-        result_str = json.dumps(result, default=str)
-        result_preview = result_str[:1000] + "..." if len(result_str) > 1000 else result_str
-    except Exception:
-        result_preview = str(result)[:1000]
+    result_preview = _serialize_preview(result, 1000)
 
     log_sync("subagent_tool_dispatch", LogLevel.INFO if success else LogLevel.ERROR, {
         "agent": agent,
@@ -900,5 +1104,7 @@ def log_tool_dispatch_sync(
         "arguments": arguments,
         "result_preview": result_preview,
         "success": success,
+        "transport_success": True,
+        "task_success": success,
         "duration_ms": duration_ms,
     })

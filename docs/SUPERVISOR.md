@@ -107,6 +107,12 @@ SUPERVISOR_MODEL=gpt-4.1
 
 # Optional: Vector store ID for file_search capability
 SUPERVISOR_VECTOR_STORE_ID=vs_xxx
+
+# Optional: store uncapped LLM/tool payloads in session logs
+LOG_FULL_PAYLOADS=false
+
+# Optional: include each assistant streaming delta in logs
+LOG_VERBOSE_DELTAS=false
 ```
 
 ### Context Management
@@ -151,6 +157,8 @@ All MCP server tools are available with `server__tool` naming:
 |------|---------|
 | `supervisor.py` | Supervisor agent implementation |
 | `main.py` | Realtime agent + routing integration |
+| `session_logger.py` | Structured event logger with trace/span correlation IDs |
+| `log_viewer.py` | CLI that renders session JSONL logs as a causal tree |
 
 ### Key Classes
 
@@ -163,7 +171,7 @@ class SupervisorAgent:
     def __init__(self, mcp_servers, native_tools, model, vector_store_id):
         # ...
 
-    async def process(self, message, context) -> AsyncGenerator[SupervisorChunk, None]:
+    async def process(self, message, context, interaction_id=None) -> AsyncGenerator[SupervisorChunk, None]:
         # Streams structured chunks back to Realtime.
         # Emits complete only on successful termination.
         # Emits error and stops early on stream/API failures.
@@ -172,6 +180,62 @@ class SupervisorAgent:
         # - a terminal error chunk when call_id is missing
         # ...
 ```
+
+## Observability and Debugging
+
+### Event Model
+
+`session_logger.py` writes streaming JSONL logs to `logs/<session_id>.jsonl` and a final summary JSON to `logs/<session_id>.json`. The logger captures the full multi-agent communication path:
+
+- Realtime transcripts and assistant responses
+- Realtime `tool_start` / `tool_end` events
+- Realtime ↔ Supervisor `agent_call` / `agent_response` handoffs
+- Supervisor per-round `llm_call` / `llm_response` events
+- Supervisor `reasoning_summary` events from surfaced Responses API reasoning summaries
+- Supervisor ↔ native/MCP/Anki subagent tool calls
+- Anki subagent LLM calls/responses and AnkiConnect dispatches
+- `ContextManager` background summarization prompts/responses
+
+Each log entry includes causal fields when available:
+
+| Field | Meaning |
+|-------|---------|
+| `trace_id` | One top-level user turn |
+| `interaction_id` | One Supervisor escalation cycle |
+| `span_id` / `parent_span_id` | Parent-child event linkage |
+| `round` | Supervisor round counter |
+| `response_id` | Responses API response ID |
+| `tool_call_id` | Function-call ID for tool execution |
+
+`transport_success` and `task_success` are tracked separately on agent/tool responses so you can distinguish "the API call returned" from "the requested task actually succeeded." This matters for tool wrappers that may return an error payload without throwing an exception.
+
+### Inspecting a Session
+
+Use the log viewer to inspect a saved JSONL log:
+
+```bash
+python log_viewer.py logs/session_XXXXXXXX_YYYYYYYY.jsonl --level detail
+```
+
+Follow a live session while HALfred is running:
+
+```bash
+python log_viewer.py logs/session_XXXXXXXX_YYYYYYYY.jsonl --follow --level full
+```
+
+Recommended workflow when debugging bad agent behavior:
+
+1. Reproduce the issue once.
+2. Open the session JSONL with `--level detail` to find the `trace_id` for the bad user turn.
+3. Inspect the Supervisor `llm_call` input, `reasoning_summary`, tool calls, and final `llm_response` for that trace.
+4. If the failure happened after context compaction, inspect `context_manager` summarization events in the same trace.
+5. Enable `LOG_FULL_PAYLOADS=true` and rerun only if capped previews hide the prompt/response detail you need.
+
+### Implementation Notes
+
+- `main.py` assigns one `trace_id` per user turn and uses a shared `_consume_supervisor_chunks()` helper so both Supervisor call paths handle text, tool events, reasoning, completion, and errors consistently.
+- `supervisor.py` wraps each round/tool scope in logger spans, logs `previous_response_id` / `response_id`, and emits `reasoning_summary` only for summaries surfaced by the Responses API, not hidden chain-of-thought.
+- `session_logger.py` uses `contextvars` so async tasks and `asyncio.to_thread()` subagent calls inherit the active trace/span context without a mutable global trace pointer.
 
 #### `ContextManager`
 

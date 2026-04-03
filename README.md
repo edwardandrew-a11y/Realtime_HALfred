@@ -553,6 +553,72 @@ HALfred uses a **two-tier agent architecture**:
 
 See [docs/SUPERVISOR.md](docs/SUPERVISOR.md) for detailed architecture documentation.
 
+## Agent Observability and Log Viewer
+
+HALfred writes structured session logs to `logs/<session_id>.jsonl` while the app is running, plus a summary `logs/<session_id>.json` on shutdown. The logger now records the full multi-agent communication path with causal IDs so you can reconstruct what each agent saw, what it sent, and which response or tool call triggered the next step.
+
+### What Gets Logged
+
+- Realtime user turns: audio transcripts, committed user messages, and complete assistant text responses
+- Realtime tool events: `tool_start` / `tool_end` from the front-desk agent
+- Realtime ↔ Supervisor handoffs: `agent_call` / `agent_response`
+- Supervisor LLM rounds: per-round `llm_call`, `llm_response`, and surfaced `reasoning_summary`
+- Supervisor ↔ tool/subagent calls: native tool, MCP tool, and Anki subagent request/response events
+- Anki subagent internals: LLM calls/responses and AnkiConnect dispatches
+- Context summarization: the background `ContextManager` summary prompt and model response
+
+Each event includes correlation fields when available:
+
+| Field | Meaning |
+|-------|---------|
+| `trace_id` | One top-level user turn across Realtime, Supervisor, subagents, and tools |
+| `interaction_id` | One full Supervisor escalation cycle |
+| `span_id` / `parent_span_id` | Parent/child event relationships for tree reconstruction |
+| `round` | Supervisor LLM round number |
+| `response_id` | OpenAI Responses API response ID for chained rounds |
+| `tool_call_id` | Function-call ID tying a tool event to the LLM call that requested it |
+
+### Viewing Logs
+
+Use `log_viewer.py` to inspect a saved session or follow a live JSONL file.
+
+**Recommended command for live debugging:**
+
+```bash
+python log_viewer.py logs/<session_ID>.jsonl --follow --level detail
+```
+
+Replace `<session_ID>` with the actual filename from the `logs/` directory (e.g. `session_1775208209_8e0d79f3.jsonl`).
+
+**Command options:**
+
+| Option | Values | What it does |
+|--------|--------|--------------|
+| *(no flag)* | — | Read the file once and exit |
+| `--follow` | — | Tail the file and print new events as they arrive (like `tail -f`). Use this while HALfred is running. |
+| `--level` | `summary` | User turns, agent handoffs, final assistant replies, and errors only |
+| | `detail` | Everything in summary, plus LLM calls/responses and reasoning summaries. **Good default for debugging.** |
+| | `full` | Everything in detail, plus tool dispatches, tool start/end events, and per-delta assistant streaming |
+| `--show-ids` | — | Print trace/span/interaction IDs alongside each event for correlating entries |
+| `--refresh-interval` | seconds (default `0.5`) | How often `--follow` polls for new log lines |
+
+**Examples:**
+
+```bash
+# Follow a live session (recommended)
+python log_viewer.py logs/<session_ID>.jsonl --follow --level detail
+
+# Read a completed session at full verbosity
+python log_viewer.py logs/<session_ID>.jsonl --level full
+
+# Follow with correlation IDs visible
+python log_viewer.py logs/<session_ID>.jsonl --follow --level detail --show-ids
+```
+
+### Payload Capture Controls
+
+By default, long prompts/responses/tool outputs are capped in logs to keep files manageable. Set `LOG_FULL_PAYLOADS=true` when you need full prompt/response and tool payload capture for debugging. This can store sensitive data and full tool arguments/results verbatim, so only enable it intentionally. Set `LOG_VERBOSE_DELTAS=true` to log every assistant text delta in addition to the assembled `assistant_text_complete` event.
+
 ## Audio Configuration
 
 - **Sample Rate:** 24 kHz
@@ -698,6 +764,8 @@ python -c "import sounddevice as sd; print(sd.query_devices())"
 | `DEV_MODE` | No | `false` | Enable developer debug commands |
 | `SUPERVISOR_MODEL` | No | `gpt-4.1` | Model for Supervisor agent (Responses API) |
 | `SUPERVISOR_VECTOR_STORE_ID` | No | - | Vector store ID for file_search RAG capability |
+| `LOG_FULL_PAYLOADS` | No | `false` | Store uncapped LLM/tool payloads in logs. May include sensitive tool args/results verbatim |
+| `LOG_VERBOSE_DELTAS` | No | `false` | Also log each assistant streaming delta as `assistant_text_delta` events |
 
 ## Project Structure
 
@@ -710,6 +778,7 @@ Realtime_HALfred/
 ├── anki_agent.py               # Anki subagent used by the Supervisor
 ├── anki_connect.py             # Thin AnkiConnect client
 ├── session_logger.py           # Session event logger
+├── log_viewer.py               # CLI for rendering JSONL logs as a causal tree
 ├── mcp_schema_fix.py           # Patches MCP tool schemas for Realtime API compatibility
 ├── native_screenshot.py        # Native screenshot tool exposed to the Supervisor
 ├── automation_safety.py        # Desktop automation safety wrapper

@@ -460,7 +460,11 @@ def dispatch_tool(name: str, args: Dict[str, Any]) -> Any:
         # Default to "*" to show all cards if no query provided
         query = args.get("query", "*") or "*"
         card_ids = gui_browse(query, None)
-        return {"ok": True, "card_ids": card_ids, "count": len(card_ids), "query": query}
+        result: dict = {"ok": True, "query": query}
+        # Return card count only for specific searches, not for open-all ("*").
+        if query != "*":
+            result["count"] = len(card_ids)
+        return result
 
     if name == "anki_gui_add_cards":
         # Use defaults if parameters not provided (allows just opening the dialog)
