@@ -359,27 +359,31 @@ class SessionLogger:
             while True:
                 entry = await self.queue.get()
 
-                # None signals shutdown
-                if entry is None:
-                    break
+                try:
+                    # None signals shutdown
+                    if entry is None:
+                        break
 
-                # Convert to dict
-                entry_dict = entry.to_dict()
+                    # Convert to dict
+                    entry_dict = entry.to_dict()
 
-                # Append to events list (for final summary)
-                self.events.append(entry_dict)
+                    # Append to events list (for final summary)
+                    self.events.append(entry_dict)
 
-                # Write immediately to JSONL file (crash-safe)
-                if self._jsonl_file:
-                    try:
-                        self._jsonl_file.write(json.dumps(entry_dict) + '\n')
-                        self._jsonl_file.flush()  # Force write to disk
-                    except Exception as e:
-                        print(f"[session_logger] ERROR writing to JSONL: {e}")
+                    # Write immediately to JSONL file (crash-safe)
+                    if self._jsonl_file:
+                        try:
+                            self._jsonl_file.write(json.dumps(entry_dict) + '\n')
+                            self._jsonl_file.flush()  # Force write to disk
+                        except Exception as e:
+                            print(f"[session_logger] ERROR writing to JSONL: {e}")
 
-                # Write console summary if enabled
-                if self.console_output:
-                    self._print_console_summary(entry)
+                    # Write console summary if enabled
+                    if self.console_output:
+                        self._print_console_summary(entry)
+                finally:
+                    # Always mark the item done so queue.join() / drain() can complete.
+                    self.queue.task_done()
 
         except Exception as e:
             print(f"[session_logger] ERROR in writer loop: {e}")
@@ -961,6 +965,139 @@ class SessionLogger:
         )
         await self._enqueue(entry)
 
+    # -------------------------
+    # Metaprompt Event Logging
+    # -------------------------
+
+    async def log_user_feedback(
+        self,
+        interaction_id: str,
+        rating: bool,
+        text: str = "",
+        prompt_version: Optional[str] = None,
+    ) -> None:
+        """
+        Log explicit user satisfaction feedback for a completed escalation.
+
+        Args:
+            interaction_id: Links back to the escalation in the log.
+            rating: True = thumbs up, False = thumbs down.
+            text: Optional free-text description from the user (character-limited at UI).
+            prompt_version: Active supervisor prompt version ID at the time of feedback.
+        """
+        entry = self._make_entry(
+            event_type="user_feedback",
+            level=LogLevel.INFO,
+            data={
+                "interaction_id": interaction_id,
+                "rating": "thumbs_up" if rating else "thumbs_down",
+                "text": _cap(text, 500) or "",
+                "prompt_version": prompt_version,
+                "processed": False,   # set True by meta-agent after it reads this entry
+            }
+        )
+        await self._enqueue(entry)
+
+    async def log_metaprompt_proposal(
+        self,
+        proposal_id: str,
+        agents_affected: list,
+        decision_state: str,
+        before_text: str,
+        after_text: str,
+        reasoning: str,
+        champion_version_id: Optional[str],
+        challenger_version_id: Optional[str],
+        champion_score: Optional[float],
+        challenger_score: Optional[float],
+        is_contract_level_change: bool = False,
+        constraint_operations: Optional[list] = None,
+        contradicts_constraints: Optional[list] = None,
+    ) -> None:
+        """
+        Log a meta-agent prompt proposal before the user sees the approval dialog.
+
+        Args:
+            proposal_id: Unique ID for this proposal run.
+            agents_affected: List of agent names affected ("realtime", "supervisor", or both).
+            decision_state: "PROMOTE", "ROLLBACK", or "HOLD".
+            before_text: The current prompt text (truncated for log).
+            after_text: The proposed new prompt text (truncated for log).
+            reasoning: Meta-agent's <reasoning> block (stripped of injection risk).
+            champion_version_id: Version ID of the current best-performing version.
+            challenger_version_id: Version ID of the candidate being evaluated.
+            champion_score: Numeric score of the champion version.
+            challenger_score: Numeric score of the challenger version.
+            is_contract_level_change: True if the change modifies escalation triggers or output format.
+            constraint_operations: List of constraint ops from the meta-agent proposal.
+            contradicts_constraints: List of constraint IDs being overridden.
+        """
+        entry = self._make_entry(
+            event_type="metaprompt_proposal",
+            level=LogLevel.INFO,
+            data={
+                "proposal_id": proposal_id,
+                "agents_affected": agents_affected,
+                "decision_state": decision_state,
+                "before_preview": _cap(before_text, 400),
+                "after_preview": _cap(after_text, 400),
+                "reasoning": _cap(reasoning, 800),
+                "champion_version_id": champion_version_id,
+                "challenger_version_id": challenger_version_id,
+                "champion_score": champion_score,
+                "challenger_score": challenger_score,
+                "is_contract_level_change": is_contract_level_change,
+                "constraint_operations": constraint_operations or [],
+                "contradicts_constraints": contradicts_constraints or [],
+            }
+        )
+        await self._enqueue(entry)
+
+    async def log_metaprompt_decision(
+        self,
+        proposal_id: str,
+        decision: str,
+        reason_text: str = "",
+        new_version_id: Optional[str] = None,
+        timed_out: bool = False,
+        constraint_ids_affected: Optional[list] = None,
+    ) -> None:
+        """
+        Log the user's approval/denial of a meta-agent proposal.
+
+        Args:
+            proposal_id: Links back to the proposal entry.
+            decision: "approved", "denied", "skipped", or "deploy_failed".
+            reason_text: Optional denial reason from the dialog (fed back to meta-agent).
+            new_version_id: Version ID of the newly deployed prompt (on approval).
+            timed_out: True if the dialog timed out (treated as denial).
+            constraint_ids_affected: List of constraint IDs written on approval.
+        """
+        entry = self._make_entry(
+            event_type="metaprompt_decision",
+            level=LogLevel.INFO,
+            data={
+                "proposal_id": proposal_id,
+                "decision": decision,
+                "reason_text": _cap(reason_text, 500) or "",
+                "new_version_id": new_version_id,
+                "timed_out": timed_out,
+                "constraint_ids_affected": constraint_ids_affected or [],
+            }
+        )
+        await self._enqueue(entry)
+
+    async def drain(self) -> None:
+        """
+        Wait until all queued log entries have been written to disk.
+
+        Call this before offline analysis (e.g., before running the meta-agent)
+        to ensure the JSONL file is fully flushed and consistent.
+        Uses asyncio.Queue.join() which blocks until queue.task_done() is called
+        for every item put into the queue.
+        """
+        await self.queue.join()
+
 
 # -------------------------
 # Global Logger Access
@@ -1040,6 +1177,67 @@ def log_sync(event_type: str, level: LogLevel, data: Dict[str, Any]):
         _global_logger._jsonl_file.flush()
     except Exception as e:
         print(f"[session_logger] ERROR writing sync log: {e}")
+
+
+async def log_user_feedback(
+    interaction_id: str,
+    rating: bool,
+    text: str = "",
+    prompt_version: Optional[str] = None,
+) -> None:
+    """Convenience function for logging user satisfaction feedback."""
+    if _global_logger:
+        await _global_logger.log_user_feedback(interaction_id, rating, text, prompt_version)
+
+
+async def log_metaprompt_proposal(
+    proposal_id: str,
+    agents_affected: list,
+    decision_state: str,
+    before_text: str,
+    after_text: str,
+    reasoning: str,
+    champion_version_id: Optional[str],
+    challenger_version_id: Optional[str],
+    champion_score: Optional[float],
+    challenger_score: Optional[float],
+    is_contract_level_change: bool = False,
+    constraint_operations: Optional[list] = None,
+    contradicts_constraints: Optional[list] = None,
+) -> None:
+    """Convenience function for logging a meta-agent proposal."""
+    if _global_logger:
+        await _global_logger.log_metaprompt_proposal(
+            proposal_id, agents_affected, decision_state,
+            before_text, after_text, reasoning,
+            champion_version_id, challenger_version_id,
+            champion_score, challenger_score,
+            is_contract_level_change,
+            constraint_operations,
+            contradicts_constraints,
+        )
+
+
+async def log_metaprompt_decision(
+    proposal_id: str,
+    decision: str,
+    reason_text: str = "",
+    new_version_id: Optional[str] = None,
+    timed_out: bool = False,
+    constraint_ids_affected: Optional[list] = None,
+) -> None:
+    """Convenience function for logging the user's approval/denial decision."""
+    if _global_logger:
+        await _global_logger.log_metaprompt_decision(
+            proposal_id, decision, reason_text, new_version_id, timed_out,
+            constraint_ids_affected,
+        )
+
+
+async def drain_logger() -> None:
+    """Wait for all queued log entries to be written to disk."""
+    if _global_logger:
+        await _global_logger.drain()
 
 
 def log_llm_call_sync(

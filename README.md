@@ -2,7 +2,7 @@
 
 A Python-based realtime voice assistant powered by OpenAI's Realtime API, OpenAI Responses API, and ElevenLabs TTS. HALfred is a sardonic, sharp-tongued AI companion with personality, natural voice conversations, screen analysis, and optional desktop automation through MCP integration.
 
-> **Current architecture:** a low-latency Realtime "front desk" agent handles conversation and escalates tool-heavy work to a Supervisor agent. See [docs/SUPERVISOR.md](docs/SUPERVISOR.md) for details.
+> **Current architecture:** a low-latency Realtime "front desk" agent handles conversation and escalates tool-heavy work to a Supervisor agent. Prompt text is loaded from versioned files via `prompt_store.py`, and an optional metaprompt agent can propose prompt improvements during dormancy. See [docs/SUPERVISOR.md](docs/SUPERVISOR.md) and [docs/METAPROMPT.md](docs/METAPROMPT.md) for details.
 
 ## Quick Start
 
@@ -47,6 +47,7 @@ Realtime HALfred uses:
 - 💻 **Terminal Access** - Safe shell command execution with command-level safety controls
 - 🔧 **Extensible Tools** - MCP integration allows adding new capabilities easily
 - 🎧 **Half-Duplex Audio** - Mic capture stops while HALfred is responding and resumes automatically in continuous mode
+- 🧠 **Optional Metaprompt Optimization** - During dormancy, HALfred can review feedback and propose versioned prompt updates for human approval
 
 ## ⚠️ Important Notes
 
@@ -501,6 +502,8 @@ HALfred uses a **two-tier agent architecture**:
 1. **Realtime Agent** - "Front desk" for low-latency conversation and escalation; its only tool is `escalate_to_supervisor`
 2. **Supervisor Agent** - Handles screenshots, web search, code, Anki, terminal access, automation, and MCP tools
 
+An optional **Metaprompt Agent** runs between sessions when `ENABLE_METAPROMPT_AGENT=true`. It reads recent logs, user feedback, prompt version history, and the feedback-derived constraint registry, then proposes prompt changes for explicit human approval. See [docs/METAPROMPT.md](docs/METAPROMPT.md).
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                      Realtime HALfred                        │
@@ -566,6 +569,9 @@ HALfred writes structured session logs to `logs/<session_id>.jsonl` while the ap
 - Supervisor ↔ tool/subagent calls: native tool, MCP tool, and Anki subagent request/response events
 - Anki subagent internals: LLM calls/responses and AnkiConnect dispatches
 - Context summarization: the background `ContextManager` summary prompt and model response
+- Metaprompt lifecycle: `user_feedback`, `metaprompt_proposal`, `metaprompt_decision`, `metaprompt_skip`, and `feedback_processed`
+
+When the metaprompt feature is enabled, proposal/decision logs also capture prompt-version comparisons, constraint operations, and the IDs of any constraints that were actually updated. For the full metaprompt flow and event schema, see [docs/METAPROMPT.md](docs/METAPROMPT.md).
 
 Each event includes correlation fields when available:
 
@@ -629,7 +635,7 @@ By default, long prompts/responses/tool outputs are capped in logs to keep files
 
 ## Personality
 
-Halfred's personality is defined in the `instructions` prompt assembled in `main.py`. Key traits:
+Halfred's personality is defined by the active Realtime prompt loaded through `prompt_store.py`, typically from `prompts/realtime_prompt.md` with `{user_name}` and `{user_context}` filled at startup. If prompt loading fails, HALfred falls back to a minimal hardcoded safety prompt. Key traits:
 - Refers to himself as "Halfred," never as an AI or assistant
 - Quick, clever, and darkly humorous
 - Casual, skeptical, and sometimes sarcastic
@@ -766,6 +772,9 @@ python -c "import sounddevice as sd; print(sd.query_devices())"
 | `SUPERVISOR_VECTOR_STORE_ID` | No | - | Vector store ID for file_search RAG capability |
 | `LOG_FULL_PAYLOADS` | No | `false` | Store uncapped LLM/tool payloads in logs. May include sensitive tool args/results verbatim |
 | `LOG_VERBOSE_DELTAS` | No | `false` | Also log each assistant streaming delta as `assistant_text_delta` events |
+| `ENABLE_METAPROMPT_AGENT` | No | `false` | Enable the dormancy-time metaprompt agent that proposes prompt improvements for approval |
+| `METAPROMPT_MODEL` | No | `gpt-4.1` | Model used by the metaprompt agent |
+| `PROMPT_HMAC_KEY` | No | unset | Optional HMAC key for prompt file integrity checking in `prompt_store.py` |
 
 ## Project Structure
 
@@ -775,6 +784,9 @@ Key files and directories:
 Realtime_HALfred/
 ├── main.py                     # Main application entry point (Realtime agent)
 ├── supervisor.py               # Supervisor agent (Responses API for complex tasks)
+├── metaprompt_agent.py         # Dormancy-time prompt optimization agent
+├── prompt_store.py             # Versioned prompt loading, integrity checks, prompt deployment
+├── constraint_registry.py      # Feedback-derived prompt constraint registry
 ├── anki_agent.py               # Anki subagent used by the Supervisor
 ├── anki_connect.py             # Thin AnkiConnect client
 ├── session_logger.py           # Session event logger
@@ -789,14 +801,17 @@ Realtime_HALfred/
 ├── .env.example                # Example environment file template
 ├── README.md                   # This file
 ├── FIXES_CHEAT_SHEET.md        # Notes on MCP and automation fixes
+├── prompt_versions.json        # Auto-generated prompt version ledger
 ├── package.json                # Node.js dependencies (feedback-loop-mcp only)
 ├── requirements.txt            # Python dependencies with platform notes
 ├── config.yaml                 # PTY MCP configuration
 ├── docs/
+│   ├── METAPROMPT.md           # Metaprompt agent architecture and operations
 │   ├── SUPERVISOR.md           # Supervisor agent architecture documentation
 │   ├── AUTOMATION.md           # Automation notes
 │   ├── AUTOMATION_IMPLEMENTATION.md  # Technical implementation details
 │   └── KNOWN_ISSUES.md         # Known issues and deferred fixes
+├── prompts/                    # Versioned prompt files, contract, and constraint registry
 ├── ScreenMonitorMCP/           # Screen monitoring MCP server (git submodule)
 ├── logs/                       # Session logs written by session_logger.py
 ├── screenshots/                # Saved screenshots from screencapture and debug helpers

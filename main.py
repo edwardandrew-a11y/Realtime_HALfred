@@ -81,7 +81,11 @@ from session_logger import (
     logging_context,
     new_interaction_id,
     new_trace_id,
+    drain_logger,
+    log_user_feedback,
 )
+import prompt_store
+import constraint_registry
 
 # Import Supervisor agent for complex task handling
 from supervisor import SupervisorAgent, ContextManager, ConversationContext, SupervisorChunk
@@ -403,6 +407,8 @@ class ListenState:
     rotation_pending: bool = False  # Defer proactive rotation until the current turn is idle
     current_trace_id: Optional[str] = None  # Correlates the active user turn across tasks
     user_item_trace_ids: Dict[str, str] = field(default_factory=dict)  # Maps user item IDs to the trace that owns them
+    last_turn_had_escalation: bool = False  # Set on tool_end for escalate_to_supervisor; consumed on agent_end
+    last_escalation_interaction_id: Optional[str] = None  # Interaction ID of the last escalation (for feedback correlation)
 
 
 @dataclass
@@ -411,6 +417,8 @@ class AppRuntimeState:
     state: str = "CONNECTING"
     wake_event: asyncio.Event = field(default_factory=asyncio.Event)
     retry_event: asyncio.Event = field(default_factory=asyncio.Event)
+    metaprompt_dialog_active: bool = False   # Guard: prevents concurrent feedback/approval dialogs
+    user_resumed: asyncio.Event = field(default_factory=asyncio.Event)  # Set when user activity resumes during dormancy
 
 
 @dataclass
@@ -1374,6 +1382,7 @@ async def _ensure_active(
     if app_runtime.state == "DORMANT":
         listen_state.last_user_activity_time = time.monotonic()
         safe_print("[dormant] Waking session...")
+        app_runtime.user_resumed.set()   # Signal any in-progress metaprompt run to abort
         app_runtime.wake_event.set()
 
     try:
@@ -2062,6 +2071,31 @@ async def event_loop(
             if tts:
                 await tts.flush()   # Wait for Elevenlabs to finish speaking
 
+            # Post-escalation satisfaction popup: fires after narration is complete so the
+            # user has heard the answer before being asked to rate it.
+            if listen_state.last_turn_had_escalation:
+                listen_state.last_turn_had_escalation = False
+                iid = listen_state.last_escalation_interaction_id
+                listen_state.last_escalation_interaction_id = None
+                if os.getenv("ENABLE_METAPROMPT_AGENT", "false").lower() == "true":
+                    try:
+                        from feedback_service import ask_satisfaction
+                        rating = await ask_satisfaction(
+                            interaction_id=iid or "",
+                            mcp_servers=getattr(app_runtime, "_mcp_servers", []),
+                            app_runtime=app_runtime,
+                        )
+                        if rating is not None and iid and logger:
+                            sv_version = prompt_store.get_active_version("supervisor")
+                            await log_user_feedback(
+                                interaction_id=iid,
+                                rating=rating,
+                                prompt_version=sv_version,
+                            )
+                            prompt_store.record_feedback(rating, agent="supervisor")
+                    except Exception as e:
+                        safe_print(f"[feedback] Error in satisfaction popup: {e}")
+
             # Reset turn state after response completes (ready for next turn)
             listen_state.turn_state = "idle"
             listen_state.current_trace_id = None
@@ -2082,6 +2116,14 @@ async def event_loop(
             if logger:
                 with logging_context(trace_id=listen_state.current_trace_id):
                     await logger.log_tool_end(event)
+
+            # Record that this turn included an escalation so agent_end can fire
+            # the satisfaction popup after TTS narration completes.
+            if event.tool.name == "escalate_to_supervisor":
+                listen_state.last_turn_had_escalation = True
+                listen_state.last_escalation_interaction_id = listen_state.current_trace_id
+                # Also count the tool calls that happened inside the escalation
+                prompt_store.record_tool_call(agent="supervisor")
 
             if event.tool.name == "screencapture":
                 # Screenshot flow is now handled in the custom tool handler to batch
@@ -2305,6 +2347,13 @@ async def main():
                 # Start background task (non-blocking)
                 asyncio.create_task(_init_display_detection_background())
 
+            # Initialize prompt store BEFORE SupervisorAgent so it can read the active version.
+            prompt_store.init()
+            constraint_registry.init()
+            # Record this session in the version ledger (session_id boundary, not WebSocket reconnect)
+            if logger:
+                prompt_store.record_session(logger.session_id)
+
             # Build user-specific context
             user_info = f"Maintain continuity when talking to {user_name}"
             if user_context:
@@ -2313,8 +2362,18 @@ async def main():
             print("User name:", user_name)
             print("User context:", user_context)
 
-            # System prompt that guides the RealtimeAgent's behavior/persona.
-            instructions = (
+            # Load Realtime agent prompt from prompt_store (falls back to hardcoded default
+            # if file missing, HMAC fails, or prompt_store.init() had an error).
+            _ps_instructions = prompt_store.get_realtime_prompt(
+                user_name=user_name, user_context=user_context
+            )
+            # Hardcoded default is kept here as a second-level safety net in case
+            # prompt_store itself has an import error at startup.
+            if not _ps_instructions.strip():
+                _ps_instructions = None
+
+            # Legacy hardcoded instructions (used as fallback if prompt_store returns empty)
+            _hardcoded_instructions = (
                 "# Role & Objective\n"
                 "- You are Halfred.\n"
                 "- Act as a friend and assistant to Andrew, helping with answers, information online, computer tasks (via tools), creative content, and general conversation.\n"
@@ -2416,6 +2475,8 @@ async def main():
                 "The response is streamed to TTS automatically, so briefly acknowledge completion.\n"
                 "\n"
             )
+            # Use prompt_store version when available, fall back to hardcoded string
+            instructions = _ps_instructions if _ps_instructions else _hardcoded_instructions
 
             # Build supervisor tools list - ALL tools go to Supervisor
             supervisor_native_tools = [local_time]
@@ -2560,6 +2621,26 @@ async def main():
                     if app_runtime.state == "DORMANT":
                         safe_print("[dormant] HALfred sleeping. Press PTT or type to wake.")
                         app_runtime.wake_event.clear()
+                        app_runtime.user_resumed.clear()  # Reset for this dormancy window
+
+                        # Flush any pending log writes before offline analysis
+                        if logger:
+                            await drain_logger()
+
+                        # Run the meta-agent if eligible (non-blocking; returns quickly on skip)
+                        try:
+                            from metaprompt_agent import run_if_eligible
+                            # Pass mcp_servers via a temporary attribute so feedback_service can reach them
+                            app_runtime._mcp_servers = mcp_servers
+                            await run_if_eligible(
+                                app_runtime=app_runtime,
+                                supervisor=supervisor,
+                                mcp_servers=mcp_servers,
+                                logs_dir=None,  # uses default ./logs
+                            )
+                        except Exception as _meta_err:
+                            safe_print(f"[metaprompt] Error during evaluation: {_meta_err}")
+
                         await app_runtime.wake_event.wait()
                         if app_runtime.state == "SHUTTING_DOWN":
                             break

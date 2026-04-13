@@ -2,8 +2,12 @@
 
 This document describes all tools available to the HALfred agents, organized by agent and source.
 
-**Last Updated:** 2026-04-01
-**Agent Version:** HALfred v1.20+
+**Last Updated:** 2026-04-13
+**Agent Version:** HALfred v1.24+
+
+> **New in v1.23:** Metaprompt agent system for autonomous prompt optimization.
+> **New in v1.24:** Constraint registry for persistent feedback-derived behavioral rules.
+> See [docs/METAPROMPT.md](docs/METAPROMPT.md) for the full architecture guide.
 
 ---
 

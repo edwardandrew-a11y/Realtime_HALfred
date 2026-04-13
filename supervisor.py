@@ -28,6 +28,7 @@ from agents.tool import FunctionTool
 from anki_agent import AnkiSubagent
 from mcp_schema_fix import fix_mcp_tool_schema
 from session_logger import get_global_logger, log_span, logging_context
+import prompt_store
 
 
 # -----------------------------
@@ -333,12 +334,29 @@ Examples:
         self.last_response_id: Optional[str] = None
         self._tools_cache: Optional[List[dict]] = None
 
+        # Load instructions from prompt_store (falls back to class-level INSTRUCTIONS constant
+        # if prompt_store was not initialized yet or file is unavailable).
+        loaded_instructions = prompt_store.get_supervisor_prompt()
+        self._active_instructions: str = loaded_instructions if loaded_instructions.strip() else self.INSTRUCTIONS
+
         # Add Anki subagent tool if enabled
         if enable_anki:
             self.anki_tool = AnkiAgentTool()
             self.native_tools.append(self.anki_tool)
         else:
             self.anki_tool = None
+
+    def reset_conversation(self) -> None:
+        """
+        Clear the Responses API conversation chain.
+
+        Must be called after deploying a new prompt version so the next
+        Supervisor turn does not chain onto a response generated under the
+        old prompt. The chain resets naturally on app restart, but an explicit
+        call is needed when deployment happens during a live session (dormancy).
+        """
+        self.last_response_id = None
+        print("[supervisor] Conversation chain reset (new prompt deployed)")
 
     async def _build_tools(self) -> List[dict]:
         """Build combined tool list from built-ins, native tools, and MCP servers."""
@@ -591,8 +609,13 @@ Examples:
                             "stream": True,
                         }
                         if is_initial:
-                            create_kwargs["instructions"] = self.INSTRUCTIONS
+                            create_kwargs["instructions"] = self._active_instructions
                             is_initial = False
+
+                        # Tag each API call with the active prompt version for Evals tracking.
+                        active_version = prompt_store.get_active_version("supervisor")
+                        if active_version:
+                            create_kwargs["metadata"] = {"prompt_version": active_version}
 
                         if logger:
                             await logger.log_llm_call(
@@ -603,6 +626,7 @@ Examples:
                                 metadata={
                                     "round": current_round,
                                     "previous_response_id": current_response_id,
+                                    "prompt_version": active_version,
                                 },
                             )
 
